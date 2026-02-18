@@ -1,0 +1,78 @@
+# Pre-commit hooks configuration
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # Ruff - fast Python linter & formatter (replaces black, isort, flake8)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      # Run linter with auto-fix
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      # Run formatter
+      - id: ruff-format
+
+  # Basic file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(uv\.lock|.*\.md)$
+      - id: end-of-file-fixer
+        exclude: ^uv\.lock$
+      - id: check-yaml
+        exclude: ^(\.gitlab-ci\.yml|k8s/.*)$  # GitLab CI and Kubernetes manifests (multi-document YAML)
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+
+  # Conventional Commits validation
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.6.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args:
+          - feat
+          - fix
+          - docs
+          - style
+          - refactor
+          - perf
+          - test
+          - build
+          - ci
+          - chore
+          - revert
+
+  # Python-specific checks (using uv)
+  - repo: local
+    hooks:
+      # Syntax check with uv
+      - id: python-syntax-check
+        name: Check Python syntax (uv)
+        entry: bash -c 'uv run python -m py_compile "$@"' --
+        language: system
+        types: [python]
+        pass_filenames: true
+
+      # Import validation for critical modules
+      - id: test-critical-imports
+        name: Test critical imports
+        entry: bash -c 'uv run python -c "from app.operators.sigma_broadcast import SigmaMatcherBroadcastFunction; from app.domain.rules.loader import load_sigmas_from_tdm_dict; from app.connectors.kafka_source import create_kafka_source"'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^(app/)
+
+# Configuration for specific hooks
+default_language_version:
+  python: python3.12
+
+# Run hooks in parallel for faster execution
+default_stages: [pre-commit]
+fail_fast: false

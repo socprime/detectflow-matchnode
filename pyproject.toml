@@ -1,0 +1,72 @@
+[project]
+name = "flink-sigma-detector"
+version = "0.0.1"
+description = "Real-time threat detection with Apache Flink and Sigma rules"
+requires-python = ">=3.10"
+authors = [
+    {name = "Vladyslav Gumeniuk", email = "vladyslav.gumeniuk@socprime.com"}
+]
+
+dependencies = [
+    "apache-flink==2.1.0",
+    "polars>=1.0.0",
+    "PyYAML>=6.0.2",
+    "orjson>=3.10.18",
+    "pydantic>=2.10.4",
+    "pydantic-settings>=2.7.0",
+    "structlog>=25.4.0",
+    "pyarrow==16.1.0",
+    "confluent-kafka>=2.12.1",
+    "schema-parser",
+]
+
+[project.scripts]
+flink-sigma-detector = "app.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.uv]
+# UV best practices
+managed = true              # Mark as uv-managed project
+package = true              # Enable package management
+default-groups = ["dev"]    # Auto-install dev dependencies
+
+[tool.uv.sources]
+schema-parser = { git = "https://github.com/socprime/detectflow-parser.git", tag = "v0.2.3" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+    "pre-commit>=4.3.0",
+    "pytest-mock>=3.15.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+# Ruff linting rules
+lint.select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+]
+
+lint.ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+# Format settings
+format.quote-style = "double"
+format.indent-style = "space"
