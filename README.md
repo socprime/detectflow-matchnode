@@ -4,6 +4,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.121.3-green.svg)](https://fastapi.tiangolo.com/)
 
 Real-time threat detection using Apache Flink and Sigma rules. Consumes event streams from Kafka, applies Sigma rules, and tags matched events with MITRE ATT&CK techniques and rule metadata.
+This project is a component of SOC Prime DetectFlow OSS. See its [README](https://github.com/socprime/detectflow-main) for more details and instructions.
 
 ## Features
 
@@ -67,8 +68,13 @@ See comments in `.env.example` for details.
 
 ```bash
 cp .env.example .env
-# Edit .env (Kafka, JOB_ID, topics)
-docker compose up -d
+```
+
+### Docker
+
+```bash
+docker build -t detectflow-matchnode .
+docker run -p 8000:8000 --env-file .env detectflow-matchnode
 ```
 
 The job is submitted via `standalone-job.sh` with `--pyModule app.main`. Web UI: http://localhost:8081.
