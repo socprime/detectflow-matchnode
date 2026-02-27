@@ -126,9 +126,7 @@ def test_process_events_no_filters(simple_sigma_rule, field_mapping):
     ]
     sigmas = [simple_sigma_rule]
 
-    result = process_events(
-        events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping
-    )
+    result = process_events(events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping)
     matches = result.case_ids_per_event
 
     # Should have 3 results (one per event)
@@ -310,7 +308,9 @@ def test_process_events_prefiltered_mask_none_without_filters(simple_sigma_rule,
     assert result.prefiltered_mask is None
 
 
-def test_process_events_prefiltered_mask_no_matches(simple_sigma_rule, filter_sigma_rule, field_mapping):
+def test_process_events_prefiltered_mask_no_matches(
+    simple_sigma_rule, filter_sigma_rule, field_mapping
+):
     """Test prefiltered_mask when filters don't match any events."""
     events = [
         {"winlog.event_id": 4624, "winlog.event_data.TargetUserName": "user1"},
@@ -822,9 +822,7 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_009")]
 
-    result = process_events(
-        events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping
-    )
+    result = process_events(events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping)
     matches = result.case_ids_per_event
 
     assert len(matches) == 4
@@ -1027,9 +1025,7 @@ detection:
     assert FULL_EVENT_COLUMN_NAME not in df.columns
 
     # Verify that the rule still works correctly
-    result = process_events(
-        events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping
-    )
+    result = process_events(events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping)
     matches = result.case_ids_per_event
     assert len(matches) == 2
     assert matches[0] == ["field_001"]  # Matches EventID 4624
