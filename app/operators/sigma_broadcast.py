@@ -26,10 +26,9 @@ from pyflink.datastream.state import (
 from app.config.logging import bind_context, get_logger
 from app.domain.filters.loader import Filter, convert_filter_kafka_event_to_filter
 from app.domain.logsources.loader import LogsourceConfig, convert_kafka_event_to_logsource_config
-from app.domain.rules.loader import (
-    load_sigmas_from_tdm_dict,
-)
+from app.domain.rules.loader import load_sigmas_from_rules_data
 from app.domain.sigma_matcher.helpers import process_events
+from app.domain.sigma_matcher.sigma_parser import Sigma
 
 logger = get_logger(__name__)
 
@@ -119,6 +118,12 @@ class WindowMetrics:
     matched_events: int = 0
     rule_count: int = 0
 
+    # Output counts - events ACTUALLY written to output topic
+    # output_untagged will be 0 if output_mode == "matched_only"
+    output_tagged: int = 0
+    output_untagged: int = 0
+    prefiltered_events: int = 0
+
     # Per-rule match counts
     matched_rules: dict = field(default_factory=dict)
 
@@ -158,6 +163,8 @@ class SigmaMatchingResult(NamedTuple):
     """List of parsed events (after schema parser transformation)."""
     schema_parser_errors: int = 0
     """Number of events that failed schema parsing."""
+    prefiltered_mask: list[bool] | None = None
+    """Per-event mask: True if the event was excluded by a prefilter."""
 
 
 # Define broadcast state descriptor for rules
@@ -178,6 +185,16 @@ EVENT_BUFFER_STATE_DESCRIPTOR = ListStateDescriptor(
 WINDOW_START_TIME_STATE_DESCRIPTOR = ValueStateDescriptor(
     "window-start-time-state",
     Types.LONG(),  # timestamp in milliseconds
+)
+
+EVENT_COUNT_STATE_DESCRIPTOR = ValueStateDescriptor(
+    "event-count-state",
+    Types.LONG(),  # number of buffered events in current window
+)
+
+EARLY_FLUSH_TIMER_TS_STATE_DESCRIPTOR = ValueStateDescriptor(
+    "early-flush-timer-ts-state",
+    Types.LONG(),  # pending early-flush processing-time timer timestamp
 )
 
 PARSER_STATE_DESCRIPTOR = MapStateDescriptor(
@@ -219,31 +236,36 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
     def __init__(
         self,
         window_size_seconds: int,
+        window_count_threshold: int,
         job_id: str,
         output_mode: str,
+        keep_filtered_events: bool = False,
         apply_parser_to_output_events: bool = False,
     ):
         self.window_size_ms = window_size_seconds * 1000
         self.window_size_seconds = window_size_seconds
+        self.window_count_threshold = window_count_threshold
 
         # Multi-tenancy parameters
         self.job_id = job_id
         self.output_mode = output_mode  # "all_events" or "matched_only"
+        self.keep_filtered_events = keep_filtered_events
         self.apply_parser_to_output_events = apply_parser_to_output_events
 
         # Operator-local caches (per subtask, shared across keys)
         # Rebuilt on first window after restart - fast enough
-        # Parsed rules cache (EnrichedSigma objects - expensive to create)
-        self._enriched_sigmas_cache = None
-        self._enrichment_map_cache = None
+        self._sigmas_cache = None
+        # SHA1 hash of all rule data from broadcast state. Skips re-parsing
+        # when broadcast state was re-read but content is identical
+        # (e.g. identical rule document was re-sent to Kafka).
         self._rules_signature = None
-        # Rules data cache (raw rules from broadcast state - expensive to iterate)
-        self._rules_data_cache = None
-        self._rules_dirty = True  # Start dirty so first window reads from state
+        self._rules_state_changed = True  # Start dirty so first window reads from state
 
         # Flink-managed state (checkpointed, per-key)
         self._event_buffer_state = None
         self._window_start_time_state = None
+        self._event_count_state = None
+        self._early_flush_timer_ts_state = None
 
         # Runtime context info (filled in open())
         self._instance_id = None
@@ -252,9 +274,14 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         self._hostname = None
 
         # Flink metrics (registered in open(), available via REST API)
-        # Event counters as gauges (PyFlink counters don't expose via REST API)
+        # Cumulative counters (for Kafka metrics consumer)
         self._matched_events_count = [0]
         self._total_events_count = [0]
+        # Output rate gauges - events ACTUALLY WRITTEN to output topic per second
+        # These are the PRIMARY metrics for dashboard (updated at end of each window)
+        # outputUntaggedPerSecond will be 0 if output_mode == "matched_only"
+        self._output_tagged_per_second = [0.0]
+        self._output_untagged_per_second = [0.0]
         # Error/processing counters (internal use only)
         self._event_parsing_errors_counter = None
         self._schema_parsing_errors_counter = None
@@ -264,8 +291,9 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         # Distributions (for timing stats)
         self._window_duration_distribution = None
         self._matching_duration_distribution = None
-        # Mutable container for gauge value (gauges need a callable)
+        # Mutable containers for gauge values (gauges need a callable)
         self._active_rules_count = [0]
+        self._prefiltered_events_count = [0]
 
     def open(self, runtime_context):
         """Initialize with runtime context and managed state"""
@@ -285,6 +313,10 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         self._window_start_time_state = runtime_context.get_state(
             WINDOW_START_TIME_STATE_DESCRIPTOR
         )
+        self._event_count_state = runtime_context.get_state(EVENT_COUNT_STATE_DESCRIPTOR)
+        self._early_flush_timer_ts_state = runtime_context.get_state(
+            EARLY_FLUSH_TIMER_TS_STATE_DESCRIPTOR
+        )
 
         # Bind instance_id to all logs in this task
         bind_context(instance_id=self._instance_id)
@@ -292,12 +324,24 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         # Register custom Flink metrics (available via REST API at /jobs/{id}/vertices/{id}/subtasks/metrics)
         metrics_group = runtime_context.get_metrics_group()
 
-        # Event counters as gauges (PyFlink counters don't expose via REST API, but gauges do)
-        # Using mutable lists to allow lambda capture
+        # Cumulative event counters (for Kafka metrics consumer that updates DB totals)
         self._matched_events_count = [0]
         self._total_events_count = [0]
         metrics_group.gauge("matchedEvents", lambda: self._matched_events_count[0])
         metrics_group.gauge("totalEvents", lambda: self._total_events_count[0])
+
+        # Output rate gauges - events ACTUALLY WRITTEN to output topic per second
+        # These are the PRIMARY metrics for dashboard display
+        # Updated at end of each window with: output_count / window_duration
+        # outputUntaggedPerSecond will be 0 if output_mode == "matched_only"
+        self._output_tagged_per_second = [0.0]
+        self._output_untagged_per_second = [0.0]
+        metrics_group.gauge("outputTaggedPerSecond", lambda: self._output_tagged_per_second[0])
+        metrics_group.gauge("outputUntaggedPerSecond", lambda: self._output_untagged_per_second[0])
+
+        # Prefiltered events counter (cumulative, like matchedEvents/totalEvents)
+        self._prefiltered_events_count = [0]
+        metrics_group.gauge("prefilteredEvents", lambda: self._prefiltered_events_count[0])
 
         # Error counters (keep as counters for internal use, not exposed via REST API)
         self._event_parsing_errors_counter = metrics_group.counter("eventParsingErrors")
@@ -326,14 +370,19 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             operator="SigmaMatcherBroadcastFunction",
             job_id=self.job_id,
             window_size_seconds=self.window_size_seconds,
+            window_count_threshold=self.window_count_threshold,
             output_mode=self.output_mode,
+            keep_filtered_events=self.keep_filtered_events,
             rules_source="broadcast_stream",
             pid=os.getpid(),
             instance_id=self._instance_id,
             event_buffer_checkpointed=True,
             custom_metrics=[
-                "matchedEvents",
-                "totalEvents",
+                "matchedEvents",  # Cumulative (for Kafka metrics)
+                "totalEvents",  # Cumulative (for Kafka metrics)
+                "prefilteredEvents",  # Cumulative (events excluded by prefilters)
+                "outputTaggedPerSecond",  # Dashboard: tagged events/sec to output
+                "outputUntaggedPerSecond",  # Dashboard: untagged events/sec (0 if matched_only)
                 "eventParsingErrors",
                 "ruleParsingErrors",
                 "matchingErrors",
@@ -376,6 +425,27 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         # Add event to checkpointed buffer state (per-key)
         # Store JSON string directly (no parsing overhead - will parse in on_timer when needed)
         self._event_buffer_state.add(value)
+        event_count = (self._event_count_state.value() or 0) + 1
+        self._event_count_state.update(event_count)
+
+        # Guardrail: flush early when buffer gets too large to avoid oversized gRPC
+        # payloads when Python operator reads ListState during on_timer().
+        # The original window timer is deleted so it doesn't fire later and create
+        # unexpectedly short follow-up windows.
+        if event_count >= self.window_count_threshold:
+            scheduled_early_flush_ts = self._early_flush_timer_ts_state.value()
+            if scheduled_early_flush_ts is None:
+                original_timer_ts = window_start_time + self.window_size_ms
+                ctx.timer_service().delete_processing_time_timer(original_timer_ts)
+
+                early_flush_ts = current_time + 1
+                ctx.timer_service().register_processing_time_timer(early_flush_ts)
+                self._early_flush_timer_ts_state.update(early_flush_ts)
+                logger.info(
+                    "window flush scheduled by count threshold",
+                    threshold=self.window_count_threshold,
+                    buffered_events=event_count,
+                )
 
     def process_broadcast_element(self, value: str, ctx):  # noqa: ANN001
         """
@@ -481,14 +551,14 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             if state.contains(rule_id):
                 state.remove(rule_id)
                 # Invalidate rules cache - rules changed
-                self._rules_dirty = True
+                self._rules_state_changed = True
                 logger.info("rule deleted", rule_id=rule_id, job_id=self.job_id)
             return
 
         rule_json = orjson.dumps(event).decode("utf-8")
         state.put(rule_id, rule_json)
         # Invalidate rules cache - rules changed
-        self._rules_dirty = True
+        self._rules_state_changed = True
         logger.info(
             "rule updated",
             rule_id=rule_id,
@@ -548,6 +618,8 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         """Clear checkpointed state for next window (per-key)."""
         self._event_buffer_state.clear()
         self._window_start_time_state.clear()
+        self._event_count_state.clear()
+        self._early_flush_timer_ts_state.clear()
 
     def _extract_and_deserialize_events_from_state(self) -> tuple[list[dict], int, float]:
         """
@@ -572,106 +644,76 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         duration = time.time() - start_time
         return event_buffer, parsing_errors, duration
 
-    def _load_rules_from_state(self, ctx) -> tuple[list[dict], int, str, float]:
+    @staticmethod
+    def _read_rules_from_broadcast(rules_state: BroadcastState) -> tuple[list[dict], str]:
+        """Read all rules from broadcast state and compute content signature."""
+        rules_data = []
+        hasher = hashlib.sha1()
+
+        rule_ids = list(rules_state.keys())
+        for rule_id in sorted(rule_ids):
+            rule_json = rules_state.get(rule_id)
+            if rule_json:
+                hasher.update(rule_id.encode("utf-8"))
+                hasher.update(b"\0")
+                hasher.update(rule_json.encode("utf-8"))
+                rules_data.append(orjson.loads(rule_json))
+
+        return rules_data, hasher.hexdigest()
+
+    def _load_and_parse_rules(self, ctx, metrics: WindowMetrics) -> list[Sigma]:  # noqa: ANN001
         """
-        Load rules from broadcast state with caching (P1 optimization).
+        Load rules from broadcast state and parse into Sigma objects.
+        Raw data and parsed results are cached internally.
+
+        Populates metrics: timings.rules_loading, timings.rules_parsing,
+        rules_cache_hit, rule_count. Also updates self._active_rules_count.
 
         Returns:
-            Tuple of (rules_data, rule_count, signature, loading_duration)
-            Returns ([], 0, "", duration) on error
+            List of Sigma objects (empty if no rules)
         """
-        start_time = time.time()
+        metrics.timings.rules_loading.start = time.time()
 
-        # Check if we can use cached rules_data (P1 optimization)
-        use_cached = (
-            not self._rules_dirty
-            and self._rules_data_cache is not None
-            and self._rules_signature is not None
-        )
+        if not self._rules_state_changed and self._sigmas_cache is not None:
+            metrics.timings.rules_loading.end = time.time()
+            metrics.timings.rules_parsing.start = time.time()
+            metrics.timings.rules_parsing.end = time.time()
+            metrics.rules_cache_hit = True
+            metrics.rule_count = len(self._sigmas_cache)
+            self._active_rules_count[0] = metrics.rule_count
+            return self._sigmas_cache
 
-        if use_cached:
-            rules_data = self._rules_data_cache
-            rule_count = len(rules_data)
-            signature = self._rules_signature
-            logger.debug("using cached rules_data", rule_count=rule_count)
-        else:
-            rules_state = ctx.get_broadcast_state(RULES_STATE_DESCRIPTOR)
-            rules_data = []
-            rule_count = 0
-            hasher = hashlib.sha1()
+        rules_state = ctx.get_broadcast_state(RULES_STATE_DESCRIPTOR)
+        rules_data, signature = self._read_rules_from_broadcast(rules_state)
+        self._rules_state_changed = False
 
-            try:
-                rule_ids = list(rules_state.keys())
-                for rule_id in sorted(rule_ids):
-                    rule_json = rules_state.get(rule_id)
-                    if rule_json:
-                        hasher.update(rule_id.encode("utf-8"))
-                        hasher.update(b"\0")
-                        hasher.update(rule_json.encode("utf-8"))
-                        rules_data.append(orjson.loads(rule_json))
-                        rule_count += 1
-            except Exception as e:
-                logger.exception("broadcast state read error", error=str(e))
-                return [], 0, "", time.time() - start_time
+        metrics.timings.rules_loading.end = time.time()
+        metrics.timings.rules_parsing.start = time.time()
 
-            signature = hasher.hexdigest()
-            self._rules_data_cache = rules_data
-            self._rules_dirty = False
-            logger.debug("rules_data cache updated", rule_count=rule_count)
+        if signature == self._rules_signature and self._sigmas_cache is not None:
+            logger.debug("using cached parsed rules", signature=signature[:8])
+            metrics.timings.rules_parsing.end = time.time()
+            metrics.rules_cache_hit = True
+            metrics.rule_count = len(self._sigmas_cache)
+            self._active_rules_count[0] = metrics.rule_count
+            return self._sigmas_cache
 
-        duration = time.time() - start_time
-        return rules_data, rule_count, signature, duration
+        sigmas = load_sigmas_from_rules_data(rules_data)
 
-    def _parse_rules_with_cache(
-        self,
-        rules_data: list[dict],
-        current_signature: str,
-    ) -> tuple[list, dict, list, bool] | None:
-        """
-        Parse rules from JSON with P0 caching optimization.
+        self._sigmas_cache = sigmas
+        self._rules_signature = signature
+        metrics.rule_count = len(sigmas)
+        self._active_rules_count[0] = metrics.rule_count
+        logger.debug("rules cache updated", signature=signature[:8])
 
-        Returns:
-            Tuple of (enriched_sigmas, enrichment_map, sigma_objects, cache_hit)
-            or None if parsing failed
-        """
-        use_cached = (
-            self._rules_signature == current_signature and self._enriched_sigmas_cache is not None
-        )
-
-        if use_cached:
-            enriched_sigmas = self._enriched_sigmas_cache
-            enrichment_map = self._enrichment_map_cache
-            sigma_objects = [enriched.sigma for enriched in enriched_sigmas]
-            logger.debug("using cached rules", signature=current_signature[:8])
-            return enriched_sigmas, enrichment_map, sigma_objects, True
-
-        try:
-            enriched_sigmas = load_sigmas_from_tdm_dict(rules_data)
-        except Exception as e:
-            logger.exception("rules parsing failed", error=str(e))
-            return None
-
-        if not enriched_sigmas:
-            logger.warning("no valid rules", message="No valid rules after parsing")
-            return None
-
-        enrichment_map = {
-            enriched.case_id: enriched.get_enrichment_data() for enriched in enriched_sigmas
-        }
-        sigma_objects = [enriched.sigma for enriched in enriched_sigmas]
-
-        # Update cache
-        self._enriched_sigmas_cache = enriched_sigmas
-        self._enrichment_map_cache = enrichment_map
-        self._rules_signature = current_signature
-        logger.debug("rules cache updated", signature=current_signature[:8])
-
-        return enriched_sigmas, enrichment_map, sigma_objects, False
+        metrics.timings.rules_parsing.end = time.time()
+        metrics.rules_cache_hit = False
+        return sigmas
 
     def _run_sigma_matching(
         self,
         event_buffer: list[dict],
-        sigma_objects: list,
+        sigmas: list[Sigma],
         filters: list[Filter],
         logsource_config: LogsourceConfig,
     ) -> SigmaMatchingResult | None:
@@ -685,7 +727,7 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         try:
             result = process_events(
                 events=event_buffer,
-                sigmas=sigma_objects,
+                sigmas=sigmas,
                 filters=filters,
                 parser_dict=logsource_config.parser_config,
                 field_mapping=logsource_config.field_mapping,
@@ -698,6 +740,7 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
                 end_time=end_time,
                 parsed_events=result.parsed_events,
                 schema_parser_errors=result.schema_parser_errors,
+                prefiltered_mask=result.prefiltered_mask,
             )
         except Exception as e:
             logger.exception("sigma matching error", error=str(e))
@@ -707,17 +750,35 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         self,
         event_buffer: list[dict],
         case_ids_per_event: list[list[str]],
-        enrichment_map: dict,
+        sigmas: list[Sigma],
         custom_fields: dict | None,
         metrics: WindowMetrics,
+        prefiltered_mask: list[bool] | None = None,
     ):
         """
         Enrich matched events and yield to output.
 
-        Updates metrics.matched_events and metrics.matched_rules in place.
+        Updates metrics in place:
+        - metrics.matched_events, metrics.matched_rules
+        - metrics.output_tagged, metrics.output_untagged (events ACTUALLY written to output)
+
         Yields enriched events as JSON strings.
         """
-        for event, case_ids in zip(event_buffer, case_ids_per_event, strict=False):
+        enrichment_map = {
+            e.case_id: {
+                "rule_id": e.case_id,
+                "rule_title": e.title,
+                "severity": e.level,
+                "technique_ids": e.technique_ids,
+                "techniques": e.techniques,
+            }
+            for e in sigmas
+        }
+        for idx, (event, case_ids) in enumerate(
+            zip(event_buffer, case_ids_per_event, strict=False)
+        ):
+            is_prefiltered = bool(prefiltered_mask and prefiltered_mask[idx])
+
             if custom_fields:
                 event.update(custom_fields)
 
@@ -732,7 +793,14 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
                 metrics.matched_events += 1
                 self._matched_events_count[0] += 1
 
+            if is_prefiltered:
+                metrics.prefiltered_events += 1
+                self._prefiltered_events_count[0] += 1
+                if not self.keep_filtered_events:
+                    continue
+
             # Output mode filtering (AFTER counter update)
+            # If matched_only, untagged events are NOT written to output topic
             if self.output_mode == "matched_only" and not case_ids:
                 continue
 
@@ -748,6 +816,11 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
 
             try:
                 yield orjson.dumps(event).decode("utf-8")
+                # Count events ACTUALLY written to output topic
+                if case_ids:
+                    metrics.output_tagged += 1
+                else:
+                    metrics.output_untagged += 1
             except Exception as e:
                 logger.error("event serialization failed", error=str(e))
 
@@ -799,6 +872,7 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             "window matches",
             matched_count=metrics.matched_events,
             total_count=metrics.total_events,
+            prefiltered_count=metrics.prefiltered_events,
             match_rate_percent=round(metrics.match_rate, 1),
         )
 
@@ -819,7 +893,7 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         metrics = WindowMetrics(timings=WindowTimings(on_timer_start=time.time()))
         bind_context(key=ctx.get_current_key())
 
-        # ========== PHASE 1: Parse events from state ==========
+        # ========== Parse events from state ==========
         metrics.timings.event_parsing.start = time.time()
         event_buffer, parsing_errors, _ = self._extract_and_deserialize_events_from_state()
         metrics.timings.event_parsing.end = time.time()
@@ -831,8 +905,7 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
 
         metrics.total_events = len(event_buffer)
 
-        # ========== PHASE 2: Load rules and config from broadcast state ==========
-        metrics.timings.rules_loading.start = time.time()
+        # ========== Load rules and config from broadcast state ==========
         logsource_config = self._get_logsource_config_from_state(
             ctx.get_broadcast_state(PARSER_STATE_DESCRIPTOR)
         )
@@ -840,43 +913,26 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         custom_fields = self._get_custom_fields_from_state(
             ctx.get_broadcast_state(CUSTOM_FIELDS_STATE_DESCRIPTOR)
         )
-        rules_data, rule_count, signature, _ = self._load_rules_from_state(ctx)
-        metrics.timings.rules_loading.end = time.time()
+        sigmas = self._load_and_parse_rules(ctx, metrics)
 
-        if not rules_data:
+        if not sigmas and self.output_mode == "matched_only":
             logger.warning(
-                "window skipped", reason="waiting_for_rules", buffered_events=len(event_buffer)
+                "window skipped",
+                reason="no_rules_matched_only_mode",
+                buffered_events=len(event_buffer),
             )
             self._clear_window_state()
             return
 
-        metrics.rule_count = rule_count
-        self._active_rules_count[0] = rule_count
-
-        # ========== PHASE 3: Parse rules (with P0 caching) ==========
-        metrics.timings.rules_parsing.start = time.time()
-        parse_result = self._parse_rules_with_cache(rules_data, signature)
-        metrics.timings.rules_parsing.end = time.time()
-
-        if parse_result is None:
-            metrics.errors.rule_parsing += 1
-            self._clear_window_state()
-            return
-
-        _, enrichment_map, sigma_objects, cache_hit = parse_result
-        metrics.rules_cache_hit = cache_hit
-
         logger.info(
             "window started",
             event_count=metrics.total_events,
-            rule_count=rule_count,
-            rules_cache_hit=cache_hit,
+            rule_count=metrics.rule_count,
+            rules_cache_hit=metrics.rules_cache_hit,
         )
 
-        # ========== PHASE 4: Sigma matching ==========
-        match_result = self._run_sigma_matching(
-            event_buffer, sigma_objects, filters, logsource_config
-        )
+        # ========== Sigma matching ==========
+        match_result = self._run_sigma_matching(event_buffer, sigmas, filters, logsource_config)
 
         if match_result is None:
             metrics.errors.matching += 1
@@ -887,16 +943,17 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         metrics.timings.matching.end = match_result.end_time
         metrics.errors.schema_parsing = match_result.schema_parser_errors
 
-        # ========== PHASE 5: Enrich and emit ==========
+        # ========== Enrich and emit ==========
         metrics.timings.enrichment_emit.start = time.time()
         yield from self._enrich_and_emit_events(
             event_buffer=match_result.parsed_events
             if self.apply_parser_to_output_events
             else event_buffer,
             case_ids_per_event=match_result.case_ids_per_event,
-            enrichment_map=enrichment_map,
+            sigmas=sigmas,
             custom_fields=custom_fields,
             metrics=metrics,
+            prefiltered_mask=match_result.prefiltered_mask,
         )
         metrics.timings.enrichment_emit.end = time.time()
 
@@ -906,6 +963,17 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         metrics.timings.window_start = (
             window_start_ms / 1000.0 if window_start_ms else metrics.timings.on_timer_start
         )
+
+        # Update output rate gauges with REAL per-second values
+        # These represent events ACTUALLY WRITTEN to output topic
+        # outputUntaggedPerSecond will be 0 if output_mode == "matched_only"
+        window_duration = metrics.timings.window_duration
+        if window_duration > 0:
+            self._output_tagged_per_second[0] = metrics.output_tagged / window_duration
+            self._output_untagged_per_second[0] = metrics.output_untagged / window_duration
+        else:
+            self._output_tagged_per_second[0] = 0.0
+            self._output_untagged_per_second[0] = 0.0
 
         # Update Flink metrics and log results
         self._update_flink_metrics(metrics)
@@ -961,6 +1029,12 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             # Window metrics
             "window_total_events": metrics.total_events,
             "window_matched_events": metrics.matched_events,
+            "window_prefiltered_events": metrics.prefiltered_events,
+            "window_prefilter_rate_percent": (
+                round((metrics.prefiltered_events / metrics.total_events) * 100, 2)
+                if metrics.total_events > 0
+                else 0
+            ),
             "window_match_rate_percent": round(metrics.match_rate, 2),
             "window_start_time": round(t.window_start, 3),
             "window_end_time": round(t.on_timer_end, 3),

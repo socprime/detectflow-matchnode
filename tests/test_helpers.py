@@ -126,9 +126,8 @@ def test_process_events_no_filters(simple_sigma_rule, field_mapping):
     ]
     sigmas = [simple_sigma_rule]
 
-    matches, _, _ = process_events(
-        events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping
-    )
+    result = process_events(events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping)
+    matches = result.case_ids_per_event
 
     # Should have 3 results (one per event)
     assert len(matches) == 3
@@ -136,6 +135,7 @@ def test_process_events_no_filters(simple_sigma_rule, field_mapping):
     assert matches[0] == ["rule_001"]
     assert matches[1] == []  # EventID 4625 doesn't match
     assert matches[2] == ["rule_001"]
+    assert result.prefiltered_mask is None
 
 
 def test_process_events_with_filters_no_matches(
@@ -150,9 +150,10 @@ def test_process_events_with_filters_no_matches(
     # Filter matches EventID 4625, but events have 4624
     filters = [Filter(id="filter_001", body=filter_sigma_rule._text)]
 
-    matches, _, _ = process_events(
+    result = process_events(
         events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
     )
+    matches = result.case_ids_per_event
 
     # All events should be evaluated since no filters matched
     assert len(matches) == 2
@@ -185,9 +186,10 @@ def test_process_events_with_filters_some_matches(
     sigmas = [simple_sigma_rule]
     filters = [Filter(id="filter_001", body=filter_sigma_rule._text)]
 
-    matches, _, _ = process_events(
+    result = process_events(
         events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
     )
+    matches = result.case_ids_per_event
 
     # Should have 4 results (one per original event)
     assert len(matches) == 4
@@ -219,9 +221,11 @@ detection:
     sigmas = [Sigma(text=sigma_yaml, case_id="rule_001")]
     filters = [Filter(id="filter_001", body=filter_sigma_rule._text)]
 
-    matches, _, _ = process_events(
+    result = process_events(
         events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
     )
+
+    matches = result.case_ids_per_event
 
     # All events were filtered out, so all results should be empty
     assert len(matches) == 3
@@ -259,9 +263,11 @@ def test_process_events_with_filters_result_mapping(
     sigmas = [simple_sigma_rule]
     filters = [Filter(id="filter_001", body=filter_sigma_rule._text)]
 
-    matches, _, _ = process_events(
+    result = process_events(
         events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
     )
+
+    matches = result.case_ids_per_event
 
     # Results should be in original order
     assert len(matches) == 5
@@ -270,6 +276,53 @@ def test_process_events_with_filters_result_mapping(
     assert matches[2] == ["rule_001"]  # Original position 2
     assert matches[3] == []  # Original position 3 (filtered)
     assert matches[4] == ["rule_001"]  # Original position 4
+
+
+def test_process_events_prefiltered_mask(simple_sigma_rule, filter_sigma_rule, field_mapping):
+    """Test that prefiltered_mask correctly marks which events were excluded by prefilters."""
+    events = [
+        {"winlog.event_id": 4624, "winlog.event_data.TargetUserName": "user1"},  # Not filtered
+        {"winlog.event_id": 4625, "winlog.event_data.TargetUserName": "user2"},  # Filtered
+        {"winlog.event_id": 4624, "winlog.event_data.TargetUserName": "user3"},  # Not filtered
+        {"winlog.event_id": 4625, "winlog.event_data.TargetUserName": "user4"},  # Filtered
+    ]
+    sigmas = [simple_sigma_rule]
+    filters = [Filter(id="filter_001", body=filter_sigma_rule._text)]
+
+    result = process_events(
+        events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
+    )
+
+    assert result.prefiltered_mask is not None
+    assert result.prefiltered_mask == [False, True, False, True]
+
+
+def test_process_events_prefiltered_mask_none_without_filters(simple_sigma_rule, field_mapping):
+    """Test that prefiltered_mask is None when no filters are applied."""
+    events = [
+        {"winlog.event_id": 4624, "winlog.event_data.TargetUserName": "user1"},
+    ]
+    result = process_events(
+        events=events, sigmas=[simple_sigma_rule], filters=None, field_mapping=field_mapping
+    )
+    assert result.prefiltered_mask is None
+
+
+def test_process_events_prefiltered_mask_no_matches(
+    simple_sigma_rule, filter_sigma_rule, field_mapping
+):
+    """Test prefiltered_mask when filters don't match any events."""
+    events = [
+        {"winlog.event_id": 4624, "winlog.event_data.TargetUserName": "user1"},
+        {"winlog.event_id": 4624, "winlog.event_data.TargetUserName": "user2"},
+    ]
+    filters = [Filter(id="filter_001", body=filter_sigma_rule._text)]
+
+    result = process_events(
+        events=events, sigmas=[simple_sigma_rule], filters=filters, field_mapping=field_mapping
+    )
+
+    assert result.prefiltered_mask == [False, False]
 
 
 def test_process_events_multiple_filters(simple_sigma_rule, field_mapping):
@@ -317,9 +370,10 @@ detection:
         Filter(id="filter_002", body=filter2_yaml),
     ]
 
-    matches, _, _ = process_events(
+    result = process_events(
         events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
     )
+    matches = result.case_ids_per_event
 
     assert len(matches) == 4
     assert matches[0] == ["rule_001"]  # Not filtered, matches sigma
@@ -362,9 +416,10 @@ detection:
     sigmas = [Sigma(text=sigma_yaml, case_id="sigma_001")]
     filters = [Filter(id="filter_001", body=filter_yaml)]
 
-    matches, _, _ = process_events(
+    result = process_events(
         events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
     )
+    matches = result.case_ids_per_event
 
     assert len(matches) == 3
     assert matches[0] == ["sigma_001"]  # Matches sigma, not filtered
@@ -378,9 +433,10 @@ def test_process_events_empty_events_with_filters(filter_sigma_rule, field_mappi
     sigmas = []
     filters = [Filter(id="filter_001", body=filter_sigma_rule._text)]
 
-    matches, _, _ = process_events(
+    result = process_events(
         events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
     )
+    matches = result.case_ids_per_event
 
     assert len(matches) == 0
 
@@ -394,9 +450,10 @@ def test_process_events_empty_filters_list(simple_sigma_rule, field_mapping):
     sigmas = [simple_sigma_rule]
     filters = []
 
-    matches, _, _ = process_events(
+    result = process_events(
         events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
     )
+    matches = result.case_ids_per_event
 
     assert len(matches) == 2
     assert matches[0] == ["rule_001"]
@@ -458,9 +515,10 @@ detection:
     sigmas = [Sigma(text=sigma_yaml, case_id="rule_001")]
     filters = [Filter(id="filter_001", body=filter_yaml)]
 
-    matches, _, _ = process_events(
+    result = process_events(
         events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
     )
+    matches = result.case_ids_per_event
 
     # Verify results
     assert len(matches) == 4
@@ -492,7 +550,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_001")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 2
     assert matches[0] == ["keywords_001"]  # Contains "suspicious_process"
@@ -520,7 +579,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_002")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 4
     assert matches[0] == ["keywords_002"]  # Contains "malware"
@@ -548,7 +608,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_003")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 4
     assert matches[0] == ["keywords_003"]  # Uppercase matches (lowercased)
@@ -582,7 +643,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_004")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 2
     assert matches[0] == ["keywords_004"]  # Contains "admin" in nested field
@@ -612,7 +674,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_005")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 4
     assert matches[0] == ["keywords_005"]  # Contains "system32" (lowercased in JSON)
@@ -641,7 +704,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_006")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 5
     assert matches[0] == ["keywords_006"]  # "administrator" contains "admin"
@@ -669,7 +733,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_007")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 2
     assert matches[0] == []  # No keyword match
@@ -713,9 +778,10 @@ detection:
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_008")]
     filters = [Filter(id="filter_001", body=filter_yaml)]
 
-    matches, _, _ = process_events(
+    result = process_events(
         events=events, sigmas=sigmas, filters=filters, field_mapping=field_mapping
     )
+    matches = result.case_ids_per_event
 
     assert len(matches) == 3
     assert matches[0] == ["keywords_008"]  # Matches sigma, not filtered
@@ -756,9 +822,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_009")]
 
-    matches, _, _ = process_events(
-        events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping
-    )
+    result = process_events(events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 4
     assert matches[0] == ["keywords_009"]  # Matches both
@@ -808,7 +873,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_011")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 2
     assert matches[0] == ["keywords_011"]  # Contains both keywords
@@ -843,7 +909,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_016")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 2
     assert matches[0] == ["keywords_016"]  # Contains both keywords in full event
@@ -880,7 +947,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_017")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 3
     # All should match because the full event JSON is lowercased
@@ -917,7 +985,8 @@ detection:
     ]
     sigmas = [Sigma(text=sigma_yaml, case_id="keywords_018")]
 
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
 
     assert len(matches) == 3
     assert matches[0] == ["keywords_018"]  # Contains "administrator"
@@ -956,9 +1025,8 @@ detection:
     assert FULL_EVENT_COLUMN_NAME not in df.columns
 
     # Verify that the rule still works correctly
-    matches, _, _ = process_events(
-        events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping
-    )
+    result = process_events(events=events, sigmas=sigmas, filters=None, field_mapping=field_mapping)
+    matches = result.case_ids_per_event
     assert len(matches) == 2
     assert matches[0] == ["field_001"]  # Matches EventID 4624
     assert matches[1] == []  # Doesn't match
@@ -996,7 +1064,8 @@ detection:
     assert FULL_EVENT_COLUMN_NAME in df.columns
 
     # Verify that the rule works correctly
-    matches, _, _ = process_events(events=events, sigmas=sigmas, filters=None)
+    result = process_events(events=events, sigmas=sigmas, filters=None)
+    matches = result.case_ids_per_event
     assert len(matches) == 2
     assert matches[0] == ["keywords_019"]  # Contains "admin"
     assert matches[1] == []  # Doesn't contain keyword

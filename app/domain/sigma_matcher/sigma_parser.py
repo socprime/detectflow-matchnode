@@ -33,26 +33,26 @@ class ConditionsGroup(BaseModel, extra="forbid"):
 
 
 class Sigma:
-    def __init__(self, text: str, case_id: str, technique_ids: list[str] | None = None):
-        technique_ids = technique_ids or []
-        assert isinstance(technique_ids, list), "technique_ids should be a list"
-        for tech_id in technique_ids:
-            assert isinstance(tech_id, str), "All technique_ids should be strings"
-        assert isinstance(case_id, str), "case_id should be a string"
-        assert isinstance(text, str), "text should be a string"
-
+    def __init__(
+        self,
+        text: str,
+        case_id: str,
+        title: str | None = None,
+        level: str | None = None,
+        techniques: list[dict] | None = None,
+    ):
         self._text = text
         self.case_id = case_id
-        self.technique_ids = technique_ids
         self._dict = self._get_sigma_dict_from_text(text)
         self.query = self._parse_query()
-        self.title: str | None = self._dict.get("title")
-        self.level: str | None = self._dict.get("level")
+
+        self.title: str | None = title or self._dict.get("title")
+        self.level: str | None = level or self._dict.get("level")
+        self.techniques: list[dict] = techniques or []
+        self.technique_ids: list[str] = [t["id"] for t in self.techniques if t.get("id")]
 
     def __repr__(self):
-        return (
-            f"Sigma(case_id={self.case_id}, technique_ids={self.technique_ids}, query={self.query})"
-        )
+        return f"Sigma(case_id={self.case_id}, level={self.level}, query={self.query})"
 
     def _get_sigma_dict_from_text(self, text: str) -> dict:
         try:

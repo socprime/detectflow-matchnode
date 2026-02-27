@@ -130,6 +130,10 @@ class Settings(BaseSettings):
         default="matched_only",
         description="Output mode: 'all_events' (all events with match status) or 'matched_only' (only matched events)",
     )
+    keep_filtered_events: bool = Field(
+        default=False,
+        description="Keep events excluded by prefilters in output as unmatched. If False, drop them.",
+    )
     apply_parser_to_output_events: bool = Field(
         default=False,
         description="Apply parser to output events",
@@ -324,9 +328,13 @@ class Settings(BaseSettings):
         description="Time window size in seconds (for time-based windowing)",
     )
     window_count_threshold: int = Field(
-        default=10000,
+        default=20000,
         ge=1,
-        description="Event count threshold (for count-based windowing)",
+        description=(
+            "Maximum buffered events per key before scheduling an immediate flush.\n"
+            "Acts as a guardrail to keep on_timer() state reads bounded and avoid oversized "
+            "Python operator gRPC payloads."
+        ),
     )
 
     # ==========================================
@@ -458,8 +466,25 @@ class Settings(BaseSettings):
                 "security.protocol": "PLAINTEXT",
             }
 
+    def _read_pem_file(self, file_path: str | None) -> str | None:
+        """Read PEM file content for Java Kafka client configuration."""
+        if not file_path:
+            return None
+        try:
+            from pathlib import Path
+
+            return Path(file_path).read_text()
+        except Exception:
+            return None
+
     def get_kafka_flink_auth_config(self) -> dict[str, str]:
-        """Get Kafka authentication config for PyFlink (Java Kafka client format)"""
+        """Get Kafka authentication config for PyFlink (Java Kafka client format).
+
+        IMPORTANT: Java Kafka client uses different property names than librdkafka!
+        - Truststore: ssl.truststore.type=PEM + ssl.truststore.location (file path works)
+        - Keystore: ssl.keystore.type=PEM + ssl.keystore.certificate.chain (PEM content!)
+                    + ssl.keystore.key (PEM content!)
+        """
         if self.kafka_auth_method == "SASL":
             # PyFlink requires JAAS config format for SASL
             # IMPORTANT: Use shaded class name for Flink's shaded Kafka connector
@@ -476,20 +501,36 @@ class Settings(BaseSettings):
                 "enable.metrics.push": "false",
             }
         elif self.kafka_auth_method == "SSL":  # SSL
-            # SSL config is same for both Python and Java clients
-            config = {
+            # Java Kafka client SSL config (different from librdkafka!)
+            # For PEM format: truststore.location accepts file path,
+            # but keystore.certificate.chain and keystore.key need PEM CONTENT (not path!)
+            cert_content = self._read_pem_file(self.kafka_ssl_certificate_location)
+            key_content = self._read_pem_file(self.kafka_ssl_key_location)
+
+            config: dict[str, str] = {
                 "security.protocol": "SSL",
-                "ssl.ca.location": self.kafka_ssl_ca_location,
-                "ssl.certificate.location": self.kafka_ssl_certificate_location,
-                "ssl.key.location": self.kafka_ssl_key_location,
+                # Truststore for CA certificate (file path works with PEM type)
+                "ssl.truststore.type": "PEM",
+                "ssl.truststore.location": self.kafka_ssl_ca_location,
                 # Disable client telemetry to avoid zstd compression issues
                 "enable.metrics.push": "false",
             }
+
+            # Keystore for client certificate (mTLS) - needs PEM content, not file path!
+            if cert_content and key_content:
+                config["ssl.keystore.type"] = "PEM"
+                config["ssl.keystore.certificate.chain"] = cert_content
+                config["ssl.keystore.key"] = key_content
+
             if not self.kafka_ssl_check_hostname:
-                config["ssl.endpoint.identification.algorithm"] = "none"
+                # Empty string disables hostname verification in Java Kafka client
+                # (not "none" which causes "Unknown identification algorithm" error)
+                config["ssl.endpoint.identification.algorithm"] = ""
             if self.kafka_ssl_key_password:
-                config["ssl.key.password"] = self.kafka_ssl_key_password
+                config["ssl.keystore.password"] = self.kafka_ssl_key_password
+            # Override with JKS/PKCS12 truststore if explicitly provided
             if self.kafka_ssl_truststore_location:
+                config["ssl.truststore.type"] = "JKS"
                 config["ssl.truststore.location"] = self.kafka_ssl_truststore_location
             if self.kafka_ssl_truststore_password:
                 config["ssl.truststore.password"] = self.kafka_ssl_truststore_password

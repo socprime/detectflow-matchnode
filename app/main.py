@@ -75,6 +75,13 @@ def main():
     )
 
     parser.add_argument(
+        "--keep-filtered-events",
+        action="store_true",
+        default=None,
+        help="Keep prefiltered events in output as unmatched (default: False, i.e. drop them)",
+    )
+
+    parser.add_argument(
         "--apply-parser-to-output-events",
         action="store_true",
         default=os.getenv("APPLY_PARSER_TO_OUTPUT_EVENTS", "").lower() in ("true", "1"),
@@ -103,6 +110,7 @@ def main():
         output_topic=args.output_topic,
         rules_topic=args.rules_topic,
         output_mode=args.output_mode,
+        keep_filtered_events=args.keep_filtered_events,
         metrics_topic=args.metrics_topic,
         apply_parser_to_output_events=args.apply_parser_to_output_events,
     )

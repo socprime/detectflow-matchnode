@@ -63,6 +63,13 @@ class TestSettings:
         settings = Settings()
         assert settings.output_mode in ("all_events", "matched_only")
 
+    def test_keep_filtered_events_default(self):
+        """Test keep_filtered_events default value."""
+        from app.config.settings import Settings
+
+        settings = Settings()
+        assert settings.keep_filtered_events is False
+
     def test_rocksdb_settings(self):
         """Test RocksDB configuration settings."""
         from app.config.settings import Settings
