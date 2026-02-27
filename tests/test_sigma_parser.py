@@ -126,25 +126,70 @@ def test_sigma_init_valid():
     sigma = Sigma(
         text="detection:\n  condition: selection\n  selection:\n    EventID: 4624",
         case_id="test",
-        technique_ids=["T1234"],
+        techniques=[{"id": "T1234"}],
     )
     assert sigma.case_id == "test"
     assert sigma.technique_ids == ["T1234"]
 
 
-def test_sigma_init_invalid_technique_ids():
-    with pytest.raises(AssertionError):
-        Sigma(text="test", case_id="test", technique_ids="T1234")
+def test_sigma_init_techniques_default():
+    sigma = Sigma(
+        text="detection:\n  condition: selection\n  selection:\n    EventID: 4624",
+        case_id="test",
+    )
+    assert sigma.techniques == []
+    assert sigma.technique_ids == []
 
 
-def test_sigma_init_invalid_technique_id_type():
-    with pytest.raises(AssertionError):
-        Sigma(text="test", case_id="test", technique_ids=["T1234", 1234])
+def test_sigma_init_title_level_override_yaml():
+    sigma = Sigma(
+        text=(
+            "title: From YAML\n"
+            "level: low\n"
+            "detection:\n"
+            "  condition: selection\n"
+            "  selection:\n"
+            "    EventID: 4624"
+        ),
+        case_id="test",
+        title="From Metadata",
+        level="critical",
+    )
+
+    assert sigma.title == "From Metadata"
+    assert sigma.level == "critical"
+
+
+def test_sigma_init_title_level_fallback_to_yaml():
+    sigma = Sigma(
+        text=(
+            "title: YAML Title\n"
+            "level: medium\n"
+            "detection:\n"
+            "  condition: selection\n"
+            "  selection:\n"
+            "    EventID: 4624"
+        ),
+        case_id="test",
+    )
+
+    assert sigma.title == "YAML Title"
+    assert sigma.level == "medium"
+
+
+def test_sigma_init_technique_ids_ignores_entries_without_id():
+    sigma = Sigma(
+        text="detection:\n  condition: selection\n  selection:\n    EventID: 4624",
+        case_id="test",
+        techniques=[{"name": "no id"}, {"id": "T1003", "name": "Credential Dumping"}],
+    )
+
+    assert sigma.technique_ids == ["T1003"]
 
 
 # Test Sigma parsing methods
 def test_parse_query_simple(simple_sigma_yaml):
-    sigma = Sigma(text=simple_sigma_yaml, case_id="TEST001", technique_ids=["T1234"])
+    sigma = Sigma(text=simple_sigma_yaml, case_id="TEST001")
     query = sigma.query
     assert isinstance(query, SignatureGroup)
     assert len(query.signatures) == 1
@@ -166,7 +211,7 @@ def test_parse_query_simple(simple_sigma_yaml):
 
 
 def test_parse_query_complex(complex_sigma_yaml):
-    sigma = Sigma(text=complex_sigma_yaml, case_id="TEST002", technique_ids=["T1234"])
+    sigma = Sigma(text=complex_sigma_yaml, case_id="TEST002")
     query = sigma.query
     assert isinstance(query, SignatureGroup) and len(query.signatures) == 1
     main_group = query.signatures[0]
@@ -193,7 +238,7 @@ def test_parse_query_complex(complex_sigma_yaml):
 
 
 def test_parse_query_all_of(all_of_sigma_yaml):
-    sigma = Sigma(text=all_of_sigma_yaml, case_id="TEST003", technique_ids=["T1234"])
+    sigma = Sigma(text=all_of_sigma_yaml, case_id="TEST003")
     query = sigma.query
 
     assert isinstance(query, SignatureGroup) and len(query.signatures) == 1
@@ -222,7 +267,7 @@ def test_parse_query_all_of(all_of_sigma_yaml):
 
 
 def test_parse_query_one_of(one_of_sigma_yaml):
-    sigma = Sigma(text=one_of_sigma_yaml, case_id="TEST004", technique_ids=["T1234"])
+    sigma = Sigma(text=one_of_sigma_yaml, case_id="TEST004")
     query = sigma.query
 
     assert isinstance(query, SignatureGroup) and len(query.signatures) == 1
@@ -251,7 +296,7 @@ def test_parse_query_one_of(one_of_sigma_yaml):
 
 
 def test_parse_query_one_them(one_of_them_yaml):
-    sigma = Sigma(text=one_of_them_yaml, case_id="TEST004", technique_ids=["T1234"])
+    sigma = Sigma(text=one_of_them_yaml, case_id="TEST004")
     query = sigma.query
 
     assert isinstance(query, SignatureGroup) and len(query.signatures) == 1
@@ -281,7 +326,7 @@ def test_parse_query_one_them(one_of_them_yaml):
 
 def test_get_detection_invalid_yaml():
     with pytest.raises(SigmaNotSupported):
-        sigma = Sigma(text="invalid: yaml: :", case_id="test", technique_ids=["T1234"])
+        sigma = Sigma(text="invalid: yaml: :", case_id="test")
         sigma._get_detection_from_sigma()
 
 
@@ -403,7 +448,7 @@ detection:
         field1|startswith: a*c
 """
     with pytest.raises(SigmaNotSupported):
-        Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+        Sigma(text=sigma_text, case_id="test_case_id")
 
     sigma_text = """
 detection:
@@ -412,7 +457,7 @@ detection:
         field1|endswith: a?c
 """
     with pytest.raises(SigmaNotSupported):
-        Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+        Sigma(text=sigma_text, case_id="test_case_id")
 
     sigma_text = r"""
 detection:
@@ -420,9 +465,9 @@ detection:
     selection:
         field1|endswith: a\*c
 """
-    Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    Sigma(text=sigma_text, case_id="test_case_id")
 
 
 def test_all_of_should_be_pattern(all_of_sigma_yaml_without_pattern):
     with pytest.raises(SigmaNotSupported):
-        Sigma(text=all_of_sigma_yaml_without_pattern, case_id="TEST003", technique_ids=["T1234"])
+        Sigma(text=all_of_sigma_yaml_without_pattern, case_id="TEST003")

@@ -33,7 +33,7 @@ detection:
     filter:
         field3: filtered_value
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "value1", "field2": "test", "field3": "test"},  # match by selection1
         {"field1": "test", "field2": "value2", "field3": "test"},  # match by selection2
@@ -54,7 +54,7 @@ detection:
     selection:
         field1: null
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": None},  # match
         {"field1": "test"},  # no match
@@ -74,7 +74,7 @@ detection:
     selection:
         field1: ""
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": ""},  # match
         {"field1": "test"},  # no match
@@ -94,7 +94,7 @@ detection:
     selection:
         field1: null
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field2": "test"},  # match (field1 missing = null)
         {"field1": "test"},  # no match
@@ -113,7 +113,7 @@ detection:
     selection:
         field1: null
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field2": "test"},  # no match (field1 missing = null, negated)
         {"field1": "test"},  # match
@@ -132,7 +132,7 @@ detection:
     selection:
         field1: value1
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field2": "test"},  # no match
         {"field1": "value1"},  # match
@@ -152,7 +152,7 @@ detection:
     selection:
         field1: value1
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field2": "test"},  # match
         {"field1": "value1"},  # no match
@@ -172,7 +172,7 @@ detection:
     selection:
         field1: value
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "value"},  # match
         {"field1": "VALUE"},  # match
@@ -191,7 +191,7 @@ detection:
     selection:
         field1|contains: value
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "test value test"},  # match
         {"field1": "test VALUE test"},  # match
@@ -210,7 +210,7 @@ detection:
     selection:
         field1|startswith: value
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "value test"},  # match
         {"field1": "VALUE test"},  # match
@@ -229,7 +229,7 @@ detection:
     selection:
         field1|endswith: value
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "test value"},  # match
         {"field1": "test VALUE"},  # match
@@ -248,7 +248,7 @@ detection:
     selection:
         field1: a*c
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "abc"},  # match
         {"field1": "abdc"},  # match
@@ -268,7 +268,7 @@ detection:
     selection:
         field1: a\*c
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "abc"},  # no match
         {"field1": r"a\*c"},  # match
@@ -286,7 +286,7 @@ detection:
     selection:
         field1: a?c
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "abc"},  # match
         {"field1": "abdc"},  # no match
@@ -306,7 +306,7 @@ detection:
     selection:
         field1: a*c?e
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "abcde"},  # match
         {"field1": "abbbbbbcde"},  # match
@@ -328,7 +328,7 @@ detection:
         field2: 1*3
         field3: test
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "abc", "field2": 123, "field3": "test"},  # match
         {"field1": "abcd", "field2": 123, "field3": "test"},  # no match
@@ -349,7 +349,7 @@ detection:
         - field2: 1*3
         - field3: test
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "abc", "field2": 123, "field3": "test"},  # match
         {"field1": "abcd", "field2": 123, "field3": "test"},  # match
@@ -369,7 +369,7 @@ detection:
     selection:
         field1: a*c[de]
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": "abcd"},  # no match
         {"field1": "abc[de]"},  # match
@@ -386,7 +386,7 @@ detection:
     selection:
         field1: null
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     logs = [
         {"field1": None},  # match
         {"field1_additional": None},  # match
@@ -410,7 +410,7 @@ detection:
     selection:
         EventID: 1234
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     fm = FieldMapping({"EventID": ["winlog.event_id"]})
     logs = [
         {"EventID": "1234"},  # match
@@ -431,7 +431,7 @@ detection:
     selection:
         field1: value1
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     fm = FieldMapping({"field1": ["field1", "field1_additional"]})
 
     # Verify get_field_name_in_event doesn't duplicate field1
@@ -456,7 +456,7 @@ detection:
     selection:
         CommandLine|contains: powershell
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     fm = FieldMapping({"CommandLine": ["process.command_line", "process.args"]})
     logs = [
         {"CommandLine": "powershell.exe -c test"},  # match
@@ -476,7 +476,7 @@ detection:
     selection:
         EventID: 1234
 """
-    sigma = Sigma(text=sigma_text, case_id="test_case_id", technique_ids=[])
+    sigma = Sigma(text=sigma_text, case_id="test_case_id")
     fm = FieldMapping({})
 
     fields = fm.get_field_name_in_event("EventID")

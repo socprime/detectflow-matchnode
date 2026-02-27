@@ -363,8 +363,10 @@ def build_pipeline(env: StreamExecutionEnvironment, settings: Settings) -> None:
         .process(
             SigmaMatcherBroadcastFunction(
                 window_size_seconds=settings.window_size_seconds,
+                window_count_threshold=settings.window_count_threshold,
                 job_id=settings.job_id,
                 output_mode=settings.output_mode,
+                keep_filtered_events=settings.keep_filtered_events,
                 apply_parser_to_output_events=settings.apply_parser_to_output_events,
             ),
             output_type=Types.STRING(),
@@ -420,6 +422,7 @@ def run_sigma_detection_job(
     output_topic: str,
     rules_topic: str | None = None,
     output_mode: str | None = None,
+    keep_filtered_events: bool | None = None,
     metrics_topic: str | None = None,
     apply_parser_to_output_events: bool | None = None,
 ) -> None:
@@ -432,6 +435,7 @@ def run_sigma_detection_job(
         output_topic: Kafka topic for output (matched events or all)
         rules_topic: Kafka topic with Sigma rules (None = use settings default)
         output_mode: "all_events" or "matched_only" (None = use settings default)
+        keep_filtered_events: Keep prefiltered events in output (None = use settings default)
         metrics_topic: Kafka topic for per-rule metrics (None = disabled)
         apply_parser_to_output_events: Apply parser to output events (None = use settings default)
 
@@ -449,6 +453,8 @@ def run_sigma_detection_job(
         settings.kafka_rules_topic = rules_topic
     if output_mode:
         settings.output_mode = output_mode
+    if keep_filtered_events is not None:
+        settings.keep_filtered_events = keep_filtered_events
     if metrics_topic:
         settings.kafka_metrics_topic = metrics_topic
     if apply_parser_to_output_events is not None:

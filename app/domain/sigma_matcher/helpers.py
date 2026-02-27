@@ -24,6 +24,8 @@ class ProcessEventsResult(NamedTuple):
     """List of parsed events (after schema parser transformation)."""
     schema_parser_errors: int = 0
     """Number of events that failed schema parsing."""
+    prefiltered_mask: list[bool] | None = None
+    """Per-event mask: True if the event was excluded by a prefilter. None when no filters applied."""
 
 
 logger = get_logger(__name__)
@@ -245,18 +247,17 @@ def process_events(
     original_length = df.height
 
     # Apply prefiltering if filters are present
+    prefiltered_mask: list[bool] | None = None
     if sigma_filters:
         filters_evaluator = Evaluator(sigmas=sigma_filters, field_mapping=field_mapping)
         filtered_matches = filters_evaluator.evaluate(df)
-        # Create boolean mask: True if any filter matched (non-empty list)
-        prefilter_mask = [bool(match_list) for match_list in filtered_matches]
+        # True = event was excluded by a prefilter
+        prefiltered_mask = [bool(match_list) for match_list in filtered_matches]
 
-        # Count filtered events before filtering
-        filtered_count = sum(prefilter_mask)
+        filtered_count = sum(prefiltered_mask)
         remaining_count = original_length - filtered_count
 
-        # Exclude rows that matched filters (default behavior)
-        kept_indices = [i for i, matched in enumerate(prefilter_mask) if not matched]
+        kept_indices = [i for i, matched in enumerate(prefiltered_mask) if not matched]
         df = df[kept_indices] if kept_indices else df.head(0)
 
         logger.info(
@@ -268,11 +269,11 @@ def process_events(
         )
 
         if df.height == 0:
-            # All rows were filtered out, return empty results for all original rows
             return ProcessEventsResult(
                 case_ids_per_event=[[] for _ in range(original_length)],
                 parsed_events=parsed_events,
                 schema_parser_errors=schema_parser_errors,
+                prefiltered_mask=prefiltered_mask,
             )
 
     sigmas_evaluator = Evaluator(sigmas=sigmas, field_mapping=field_mapping)
@@ -280,19 +281,19 @@ def process_events(
 
     # Map results back to original DataFrame indices if prefiltering was applied
     if sigma_filters and df.height < original_length:
-        # Create full results list with empty lists for all original rows
         full_results = [[] for _ in range(original_length)]
-        # Map filtered results to their original positions
         for i, original_idx in enumerate(kept_indices):
             full_results[original_idx] = matches[i]
         return ProcessEventsResult(
             case_ids_per_event=full_results,
             parsed_events=parsed_events,
             schema_parser_errors=schema_parser_errors,
+            prefiltered_mask=prefiltered_mask,
         )
 
     return ProcessEventsResult(
         case_ids_per_event=matches,
         parsed_events=parsed_events,
         schema_parser_errors=schema_parser_errors,
+        prefiltered_mask=prefiltered_mask,
     )
