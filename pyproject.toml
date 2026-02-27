@@ -1,6 +1,6 @@
 [project]
-name = "flink-sigma-detector"
-version = "0.0.1"
+name = "detectflow-matchnode"
+version = "0.9.3"
 description = "Real-time threat detection with Apache Flink and Sigma rules"
 requires-python = ">=3.10"
 authors = [
@@ -8,14 +8,13 @@ authors = [
 ]
 
 dependencies = [
-    "apache-flink==2.1.0",
+    "apache-flink==2.2.0",
     "polars>=1.0.0",
     "PyYAML>=6.0.2",
     "orjson>=3.10.18",
     "pydantic>=2.10.4",
     "pydantic-settings>=2.7.0",
     "structlog>=25.4.0",
-    "pyarrow==16.1.0",
     "confluent-kafka>=2.12.1",
     "schema-parser",
 ]
@@ -31,10 +30,14 @@ build-backend = "hatchling.build"
 packages = ["app"]
 
 [tool.uv]
-# UV best practices
 managed = true              # Mark as uv-managed project
 package = true              # Enable package management
 default-groups = ["dev"]    # Auto-install dev dependencies
+# apache-flink==2.2.0 → apache-beam<=2.61.0 → pyarrow<17.0.0
+# pyarrow 16.x has known CVEs; override to a patched version
+override-dependencies = [
+    "pyarrow>=18.0.0",
+]
 
 [tool.uv.sources]
 schema-parser = { git = "https://github.com/socprime/detectflow-parser.git", tag = "v0.2.3" }

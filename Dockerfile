@@ -1,13 +1,11 @@
-FROM flink:2.1.0-scala_2.12-java17
+FROM flink:2.2.0-scala_2.12-java17
 
 
 USER root
 
 ################################################################################
-# Install Python and build dependencies
+# Install system dependencies
 ################################################################################
-# Install Python 3.10, JDK headers for pemja, and build tools
-# Combine in single layer to reduce image size
 RUN set -ex; \
     apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -23,7 +21,9 @@ RUN set -ex; \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python \
-    && ln -sf /usr/bin/pip3 /usr/bin/pip
+    && ln -sf /usr/bin/pip3 /usr/bin/pip \
+    && pip install --no-cache-dir --break-system-packages --upgrade "setuptools>=82.0.0" \
+    && rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
 
 ################################################################################
 # Set JAVA_HOME for pemja (auto-detect architecture for ARM64/AMD64)
