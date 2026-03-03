@@ -13,7 +13,7 @@ This project is a component of SOC Prime DetectFlow OSS. See its [README](https:
 - **Kafka** — input event topics, rules topic (broadcast), output detections topic; optional per-rule metrics topic; SASL/SSL auth.
 - **Checkpointing** — state persistence and recovery after failures.
 
-## System Architectu
+## System Architecture
 
 - **JobManager** — manages the job, checkpoints, and REST API.
 - **TaskManager** — runs events match job.
@@ -44,7 +44,7 @@ This project is a component of SOC Prime DetectFlow OSS. See its [README](https:
 ## Requirements
 
 - Python 3.10+
-- Apache Flink 2.1 (included in the container)
+- Apache Flink 2.2 (included in the container)
 - Kafka (input topics, rules topic, output topic)
 - Dependencies: see `pyproject.toml` (apache-flink, confluent-kafka, polars, PyYAML, orjson, pydantic, structlog, schema-parser, etc.)
 
