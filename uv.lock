@@ -317,7 +317,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/6b/b0/e595ce2a2527e169c
 
 [[package]]
 name = "detectflow-matchnode"
-version = "0.9.3"
+version = "0.9.4"
 source = { editable = "." }
 dependencies = [
     { name = "apache-flink" },

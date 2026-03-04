@@ -3,27 +3,22 @@ FROM flink:2.2.0-scala_2.12-java17
 
 USER root
 
-################################################################################
-# Install system dependencies
-################################################################################
+
+RUN set -ex; apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jdk-headless \
+    python3-pip \
+    curl \
+    wget \
+    git \
+    libpython3.12-dev \
+    gcc && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 RUN set -ex; \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        openjdk-17-jdk-headless \
-        python3-dev \
-        python3-pip \
-        python3-venv \
-        gcc \
-        g++ \
-        curl \
-        wget \
-        git \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
-    && ln -sf /usr/bin/pip3 /usr/bin/pip \
-    && pip install --no-cache-dir --break-system-packages --upgrade "setuptools>=82.0.0" \
-    && rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
+    ln -sf /usr/bin/python3 /usr/bin/python && \
+    ln -sf /usr/bin/pip3 /usr/bin/pip && \
+    pip install --no-cache-dir --break-system-packages --upgrade "setuptools>=82.0.0" && \
+    rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
 
 ################################################################################
 # Set JAVA_HOME for pemja (auto-detect architecture for ARM64/AMD64)
@@ -47,6 +42,13 @@ COPY pyproject.toml uv.lock ./
 # Install dependencies system-wide (no venv needed in container)
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system --no-cache -r pyproject.toml
+
+# Remove build-time dependencies after Python packages are installed
+RUN apt-get purge -y --auto-remove \
+        libpython3.12-dev \
+        gcc \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 ################################################################################
 # Install Flink Kafka Connector

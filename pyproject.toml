@@ -1,6 +1,6 @@
 [project]
 name = "detectflow-matchnode"
-version = "0.9.3"
+version = "0.9.4"
 description = "Real-time threat detection with Apache Flink and Sigma rules"
 requires-python = ">=3.10"
 authors = [
