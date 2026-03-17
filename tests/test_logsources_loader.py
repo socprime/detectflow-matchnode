@@ -1,7 +1,5 @@
 """Unit tests for LogsourceConfig and logsources loader."""
 
-import pytest
-
 from app.domain.logsources.loader import LogsourceConfig, convert_kafka_event_to_logsource_config
 
 
@@ -63,20 +61,20 @@ class TestGetFieldMappingFromStr:
         config = LogsourceConfig(field_mapping_str='key:\n  - first\n  - ""\n  - second')
         assert config.field_mapping.field_mapping == {"key": ["first", "second"]}
 
-    def test_non_dict_raises(self):
-        """Non-dict YAML root raises ValueError."""
-        with pytest.raises(ValueError, match="field mapping must be a dictionary"):
-            LogsourceConfig(field_mapping_str="not a dict")
+    def test_non_dict_falls_back_to_empty_mapping(self):
+        """Non-dict YAML root falls back to empty FieldMapping."""
+        config = LogsourceConfig(field_mapping_str="not a dict")
+        assert config.field_mapping.field_mapping == {}
 
-    def test_invalid_value_type_raises(self):
-        """Invalid value type (e.g. int) for a key raises ValueError."""
-        with pytest.raises(ValueError, match="invalid field mapping for key bad_key"):
-            LogsourceConfig(field_mapping_str="bad_key: 123")
+    def test_invalid_value_type_falls_back_to_empty_mapping(self):
+        """Invalid value type (e.g. int) falls back to empty FieldMapping."""
+        config = LogsourceConfig(field_mapping_str="bad_key: 123")
+        assert config.field_mapping.field_mapping == {}
 
-    def test_invalid_list_item_type_raises(self):
-        """Non-string item in list raises ValueError."""
-        with pytest.raises(ValueError, match="invalid field mapping for key k"):
-            LogsourceConfig(field_mapping_str="k:\n  - a\n  - 42")
+    def test_invalid_list_item_type_falls_back_to_empty_mapping(self):
+        """Non-string item in list falls back to empty FieldMapping."""
+        config = LogsourceConfig(field_mapping_str="k:\n  - a\n  - 42")
+        assert config.field_mapping.field_mapping == {}
 
     def test_key_with_no_value_trailing_colon_skipped(self):
         """Key with colon but no value (parses as null) is skipped."""
@@ -107,11 +105,18 @@ class TestGetFieldMappingFromStr:
         config = LogsourceConfig(field_mapping_str=yaml_str)
         assert config.field_mapping.field_mapping == {"field": ["a", "c"]}
 
-    def test_yaml_only_comments_raises(self):
-        """YAML with only comment lines parses to None and raises (not a dict)."""
+    def test_yaml_only_comments_falls_back_to_empty_mapping(self):
+        """YAML with only comment lines parses to None, falls back to empty FieldMapping."""
         yaml_str = "# field1: value1\n# field2: value2"
-        with pytest.raises(ValueError, match="field mapping must be a dictionary"):
-            LogsourceConfig(field_mapping_str=yaml_str)
+        config = LogsourceConfig(field_mapping_str=yaml_str)
+        assert config.field_mapping.field_mapping == {}
+
+    def test_invalid_mapping_preserves_parser_config(self):
+        """Invalid mapping should not discard the parser_config."""
+        parser = {"type": "syslog", "pattern": ".*"}
+        config = LogsourceConfig(parser_config=parser, field_mapping_str="not a dict")
+        assert config.parser_config == parser
+        assert config.field_mapping.field_mapping == {}
 
 
 class TestConvertKafkaEventToLogsourceConfig:
@@ -134,3 +139,171 @@ class TestConvertKafkaEventToLogsourceConfig:
         event = {"mapping": "EventID: winlog.event_id"}
         config = convert_kafka_event_to_logsource_config(event)
         assert config.field_mapping.field_mapping == {"EventID": ["winlog.event_id"]}
+
+    def test_event_with_parser_config(self):
+        """Event with parser.config is extracted correctly."""
+        parser_cfg = {"type": "syslog", "pattern": ".*"}
+        event = {"parser": {"config": parser_cfg}}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == parser_cfg
+        assert config.field_mapping.field_mapping == {}
+
+    def test_event_with_parser_config_and_valid_mapping(self):
+        """Both parser config and valid mapping are preserved."""
+        parser_cfg = {"type": "syslog", "pattern": ".*"}
+        mapping = "EventID: winlog.event_id\nSourceName:\n  - source\n  - provider"
+        event = {"parser": {"config": parser_cfg}, "mapping": mapping}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == parser_cfg
+        assert config.field_mapping.field_mapping == {
+            "EventID": ["winlog.event_id"],
+            "SourceName": ["source", "provider"],
+        }
+
+    def test_event_with_parser_config_and_bad_mapping_preserves_parser(self):
+        """Invalid mapping must not discard the valid parser_config."""
+        parser_cfg = {"type": "syslog", "pattern": ".*"}
+        event = {"parser": {"config": parser_cfg}, "mapping": "# some bad staff"}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == parser_cfg
+        assert config.field_mapping.field_mapping == {}
+
+    def test_event_with_parser_config_and_non_dict_mapping_preserves_parser(self):
+        """Non-dict mapping string falls back to empty mapping, parser_config kept."""
+        parser_cfg = {"type": "json"}
+        event = {"parser": {"config": parser_cfg}, "mapping": "just a string"}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == parser_cfg
+        assert config.field_mapping.field_mapping == {}
+
+    def test_event_with_parser_config_and_invalid_yaml_mapping_preserves_parser(self):
+        """Malformed YAML mapping falls back to empty mapping, parser_config kept."""
+        parser_cfg = {"type": "json"}
+        event = {"parser": {"config": parser_cfg}, "mapping": ":::bad yaml{["}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == parser_cfg
+        assert config.field_mapping.field_mapping == {}
+
+    def test_event_with_no_parser_key(self):
+        """Event without 'parser' key results in parser_config=None."""
+        event = {"mapping": "field: value"}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config is None
+        assert config.field_mapping.field_mapping == {"field": ["value"]}
+
+    def test_event_with_empty_parser_config(self):
+        """Event with parser key but no config yields parser_config=None."""
+        event = {"parser": {}, "mapping": "field: value"}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config is None
+        assert config.field_mapping.field_mapping == {"field": ["value"]}
+
+    def test_event_with_none_mapping(self):
+        """Explicit None mapping yields empty field_mapping."""
+        parser_cfg = {"type": "json"}
+        event = {"parser": {"config": parser_cfg}, "mapping": None}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == parser_cfg
+        assert config.field_mapping.field_mapping == {}
+
+
+class TestConvertKafkaEventMappingWithComments:
+    """Tests for convert_kafka_event_to_logsource_config with YAML comments in mapping."""
+
+    PARSER_CFG = {"some": "parser_config"}
+
+    def test_mapping_with_leading_comment(self):
+        """Leading comment before valid entries is ignored."""
+        mapping = "# Windows field mapping\nEventID: winlog.event_id"
+        event = {"parser": {"config": self.PARSER_CFG}, "mapping": mapping}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == self.PARSER_CFG
+        assert config.field_mapping.field_mapping == {"EventID": ["winlog.event_id"]}
+
+    def test_mapping_with_trailing_comment(self):
+        """Trailing comment after valid entries is ignored."""
+        mapping = "EventID: winlog.event_id\n# end of mapping"
+        event = {"parser": {"config": self.PARSER_CFG}, "mapping": mapping}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == self.PARSER_CFG
+        assert config.field_mapping.field_mapping == {"EventID": ["winlog.event_id"]}
+
+    def test_mapping_with_comments_between_entries(self):
+        """Comments between valid entries are ignored, all entries parsed."""
+        mapping = (
+            "EventID: winlog.event_id\n"
+            "# SourceName is mapped to two fields\n"
+            "SourceName:\n"
+            "  - source\n"
+            "  - provider"
+        )
+        event = {"parser": {"config": self.PARSER_CFG}, "mapping": mapping}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == self.PARSER_CFG
+        assert config.field_mapping.field_mapping == {
+            "EventID": ["winlog.event_id"],
+            "SourceName": ["source", "provider"],
+        }
+
+    def test_mapping_with_inline_comments(self):
+        """Inline comments after values are stripped by YAML parser."""
+        mapping = "EventID: winlog.event_id  # primary ID\nChannel: winlog.channel  # log channel"
+        event = {"parser": {"config": self.PARSER_CFG}, "mapping": mapping}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == self.PARSER_CFG
+        assert config.field_mapping.field_mapping == {
+            "EventID": ["winlog.event_id"],
+            "Channel": ["winlog.channel"],
+        }
+
+    def test_mapping_with_commented_out_entries(self):
+        """Commented-out entries are excluded, only active entries are kept."""
+        mapping = (
+            "EventID: winlog.event_id\n"
+            "# SourceName: winlog.provider  # disabled\n"
+            "Channel: winlog.channel"
+        )
+        event = {"parser": {"config": self.PARSER_CFG}, "mapping": mapping}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == self.PARSER_CFG
+        assert config.field_mapping.field_mapping == {
+            "EventID": ["winlog.event_id"],
+            "Channel": ["winlog.channel"],
+        }
+        assert "SourceName" not in config.field_mapping.field_mapping
+
+    def test_mapping_with_commented_list_items(self):
+        """Commented items in a list are excluded."""
+        mapping = "SourceName:\n  - source\n  # - old_provider\n  - provider"
+        event = {"parser": {"config": self.PARSER_CFG}, "mapping": mapping}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == self.PARSER_CFG
+        assert config.field_mapping.field_mapping == {
+            "SourceName": ["source", "provider"],
+        }
+
+    def test_mapping_only_comments_preserves_parser(self):
+        """Mapping that is entirely comments falls back to empty mapping, parser kept."""
+        mapping = "# all entries commented out\n# EventID: winlog.event_id"
+        event = {"parser": {"config": self.PARSER_CFG}, "mapping": mapping}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == self.PARSER_CFG
+        assert config.field_mapping.field_mapping == {}
+
+    def test_mapping_multiline_comment_block(self):
+        """Multi-line comment block followed by valid entries."""
+        mapping = (
+            "# === Field Mapping Configuration ===\n"
+            "# Version: 1.0\n"
+            "# Author: admin\n"
+            "#\n"
+            "EventID: winlog.event_id\n"
+            "Channel: winlog.channel"
+        )
+        event = {"parser": {"config": self.PARSER_CFG}, "mapping": mapping}
+        config = convert_kafka_event_to_logsource_config(event)
+        assert config.parser_config == self.PARSER_CFG
+        assert config.field_mapping.field_mapping == {
+            "EventID": ["winlog.event_id"],
+            "Channel": ["winlog.channel"],
+        }

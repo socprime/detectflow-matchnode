@@ -9,7 +9,11 @@ logger = get_logger(__name__)
 class LogsourceConfig:
     def __init__(self, parser_config: dict | None = None, field_mapping_str: str | None = None):
         self.parser_config = parser_config
-        self.field_mapping = self._get_field_mapping_from_str(field_mapping_str)
+        try:
+            self.field_mapping = self._get_field_mapping_from_str(field_mapping_str)
+        except Exception as e:
+            logger.error("invalid field mapping, falling back to empty mapping", error=str(e))
+            self.field_mapping = FieldMapping({})
 
     def __repr__(self) -> str:
         return f"LogsourceConfig(parser_config={self.parser_config}, field_mapping={self.field_mapping})"

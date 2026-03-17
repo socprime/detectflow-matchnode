@@ -1,6 +1,6 @@
 [project]
 name = "detectflow-matchnode"
-version = "0.9.4"
+version = "1.0.0"
 description = "Real-time threat detection with Apache Flink and Sigma rules"
 requires-python = ">=3.10"
 authors = [
@@ -40,7 +40,7 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
-schema-parser = { git = "https://github.com/socprime/detectflow-parser.git", tag = "v0.2.3" }
+schema-parser = { git = "https://github.com/socprime/detectflow-parser.git", tag = "v0.3.2" }
 
 [dependency-groups]
 dev = [

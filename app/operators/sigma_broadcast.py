@@ -282,6 +282,8 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         # outputUntaggedPerSecond will be 0 if output_mode == "matched_only"
         self._output_tagged_per_second = [0.0]
         self._output_untagged_per_second = [0.0]
+        # Input EPS gauge - total input events per second (source of truth for EPS)
+        self._input_events_per_second = [0.0]
         # Error/processing counters (internal use only)
         self._event_parsing_errors_counter = None
         self._schema_parsing_errors_counter = None
@@ -294,6 +296,8 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         # Mutable containers for gauge values (gauges need a callable)
         self._active_rules_count = [0]
         self._prefiltered_events_count = [0]
+        # Timestamp of last processed window (for stale detection on backend)
+        self._last_window_timestamp_ms = [0]
 
     def open(self, runtime_context):
         """Initialize with runtime context and managed state"""
@@ -336,12 +340,18 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         # outputUntaggedPerSecond will be 0 if output_mode == "matched_only"
         self._output_tagged_per_second = [0.0]
         self._output_untagged_per_second = [0.0]
+        self._input_events_per_second = [0.0]
         metrics_group.gauge("outputTaggedPerSecond", lambda: self._output_tagged_per_second[0])
         metrics_group.gauge("outputUntaggedPerSecond", lambda: self._output_untagged_per_second[0])
+        metrics_group.gauge("inputEventsPerSecond", lambda: self._input_events_per_second[0])
 
         # Prefiltered events counter (cumulative, like matchedEvents/totalEvents)
         self._prefiltered_events_count = [0]
         metrics_group.gauge("prefilteredEvents", lambda: self._prefiltered_events_count[0])
+
+        # Timestamp of last processed window (for stale detection on backend)
+        self._last_window_timestamp_ms = [0]
+        metrics_group.gauge("lastWindowTimestampMs", lambda: self._last_window_timestamp_ms[0])
 
         # Error counters (keep as counters for internal use, not exposed via REST API)
         self._event_parsing_errors_counter = metrics_group.counter("eventParsingErrors")
@@ -381,8 +391,10 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
                 "matchedEvents",  # Cumulative (for Kafka metrics)
                 "totalEvents",  # Cumulative (for Kafka metrics)
                 "prefilteredEvents",  # Cumulative (events excluded by prefilters)
+                "inputEventsPerSecond",  # Dashboard: input EPS (source of truth)
                 "outputTaggedPerSecond",  # Dashboard: tagged events/sec to output
                 "outputUntaggedPerSecond",  # Dashboard: untagged events/sec (0 if matched_only)
+                "lastWindowTimestampMs",  # Unix epoch ms when last window was processed
                 "eventParsingErrors",
                 "ruleParsingErrors",
                 "matchingErrors",
@@ -395,7 +407,6 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
                 "windowsProcessed",
                 "activeRulesCount",
                 "windowDurationMs",
-                "matchingDurationMs",
             ],
         )
 
@@ -964,23 +975,30 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             window_start_ms / 1000.0 if window_start_ms else metrics.timings.on_timer_start
         )
 
-        # Update output rate gauges with REAL per-second values
-        # These represent events ACTUALLY WRITTEN to output topic
+        # Update EPS gauges with REAL per-second values (rounded to 2 decimal places)
+        # These are the source of truth for dashboard EPS metrics
         # outputUntaggedPerSecond will be 0 if output_mode == "matched_only"
         window_duration = metrics.timings.window_duration
         if window_duration > 0:
-            self._output_tagged_per_second[0] = metrics.output_tagged / window_duration
-            self._output_untagged_per_second[0] = metrics.output_untagged / window_duration
+            self._input_events_per_second[0] = round(metrics.total_events / window_duration, 2)
+            self._output_tagged_per_second[0] = round(metrics.output_tagged / window_duration, 2)
+            self._output_untagged_per_second[0] = round(
+                metrics.output_untagged / window_duration, 2
+            )
         else:
+            self._input_events_per_second[0] = 0.0
             self._output_tagged_per_second[0] = 0.0
             self._output_untagged_per_second[0] = 0.0
+
+        # Update last window timestamp for stale detection
+        self._last_window_timestamp_ms[0] = int(time.time() * 1000)
 
         # Update Flink metrics and log results
         self._update_flink_metrics(metrics)
         self._log_window_metrics(metrics)
 
-        # Emit per-rule metrics to Kafka (if there were matches)
-        if metrics.matched_rules:
+        # Emit window metrics to Kafka (always when events were processed)
+        if metrics.total_events > 0:
             metric_json = self._create_metrics_from_window(metrics)
             if metric_json:
                 yield METRICS_OUTPUT_TAG, metric_json
@@ -992,80 +1010,26 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         Create per-rule metrics message for Kafka (consumed by admin-panel-backend).
 
         The admin-panel-backend uses this to populate pipeline_rule_metrics table
-        which tracks per-rule match counts. The critical field is rules.matched_rules.
+        which tracks per-rule match counts. Only essential fields are included.
 
         Args:
-            metrics: WindowMetrics containing all timing and match data
+            metrics: WindowMetrics containing match data
 
         Returns:
-            JSON metric string matching KafkaMetricMessage schema, or None on error
+            JSON metric string for admin-panel-backend, or None on error
         """
-        t = metrics.timings
         sorted_rules = sorted(metrics.matched_rules.items(), key=lambda x: x[1], reverse=True)
-
-        # Calculate per-rule timing approximation
-        avg_time_per_rule_ms = (
-            (t.matching.duration * 1000 / metrics.rule_count) if metrics.rule_count > 0 else 0
-        )
-
-        # Build slow rules estimation (rules that matched most = proxy for slowest)
-        # TODO: this metric is not correct, delete it
-        slow_rules_top_3 = [
-            {
-                "rule_id": rid,
-                "match_count": cnt,
-                "estimated_time_ms": round(avg_time_per_rule_ms * (cnt / metrics.matched_events), 2)
-                if metrics.matched_events > 0
-                else 0,
-            }
-            for rid, cnt in sorted_rules[:3]
-        ]
 
         metric = {
             # Identification
             "job_id": self.job_id,
             "instance_id": self._instance_id,
             "timestamp": int(time.time() * 1000),
-            # Window metrics
+            # Window metrics (essential for admin-panel)
             "window_total_events": metrics.total_events,
             "window_matched_events": metrics.matched_events,
-            "window_prefiltered_events": metrics.prefiltered_events,
-            "window_prefilter_rate_percent": (
-                round((metrics.prefiltered_events / metrics.total_events) * 100, 2)
-                if metrics.total_events > 0
-                else 0
-            ),
-            "window_match_rate_percent": round(metrics.match_rate, 2),
-            "window_start_time": round(t.window_start, 3),
-            "window_end_time": round(t.on_timer_end, 3),
-            "window_duration_seconds": round(t.window_duration, 3),
-            "window_throughput_eps": int(metrics.throughput(t.window_duration)),
-            # on_timer timing
-            "on_timer_start_time": round(t.on_timer_start, 3),
-            "on_timer_end_time": round(t.on_timer_end, 3),
-            "on_timer_duration_seconds": round(t.on_timer_duration, 3),
-            "on_timer_throughput_eps": int(metrics.throughput(t.on_timer_duration)),
-            # Phase timings (all 5 phases)
-            "phase_event_parsing_seconds": round(t.event_parsing.duration, 3),
-            "phase_event_parsing_pct": round(t.phase_percentage(t.event_parsing.duration), 1),
-            "phase_rules_loading_seconds": round(t.rules_loading.duration, 3),
-            "phase_rules_loading_pct": round(t.phase_percentage(t.rules_loading.duration), 1),
-            "phase_rules_parsing_seconds": round(t.rules_parsing.duration, 3),
-            "phase_rules_parsing_pct": round(t.phase_percentage(t.rules_parsing.duration), 1),
-            "phase_matching_seconds": round(t.matching.duration, 3),
-            "phase_matching_pct": round(t.phase_percentage(t.matching.duration), 1),
-            "phase_matching_throughput_eps": int(metrics.throughput(t.matching.duration)),
-            "phase_enrichment_emit_seconds": round(t.enrichment_emit.duration, 3),
-            "phase_enrichment_emit_pct": round(t.phase_percentage(t.enrichment_emit.duration), 1),
-            # Errors
-            "errors": metrics.errors.to_dict(),
-            # Rules - critical for admin-panel-backend per-rule tracking
+            # Per-rule tracking (critical for pipeline_rule_metrics table)
             "rules": {
-                "total": metrics.rule_count,
-                "triggered_unique": len(metrics.matched_rules),
-                "top_by_matches": [{"rule_id": rid, "count": cnt} for rid, cnt in sorted_rules[:3]],
-                "slow_rules_top_3": slow_rules_top_3,
-                "avg_time_per_rule_ms": round(avg_time_per_rule_ms, 2),
                 "matched_rules": [
                     {"rule_id": rid, "window_matches": cnt} for rid, cnt in sorted_rules
                 ],

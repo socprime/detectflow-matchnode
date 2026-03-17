@@ -317,7 +317,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/6b/b0/e595ce2a2527e169c
 
 [[package]]
 name = "detectflow-matchnode"
-version = "0.9.4"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "apache-flink" },
@@ -348,7 +348,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.10.4" },
     { name = "pydantic-settings", specifier = ">=2.7.0" },
     { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "schema-parser", git = "https://github.com/socprime/detectflow-parser.git?tag=v0.2.3" },
+    { name = "schema-parser", git = "https://github.com/socprime/detectflow-parser.git?tag=v0.3.2" },
     { name = "structlog", specifier = ">=25.4.0" },
 ]
 
@@ -1699,8 +1699,8 @@ wheels = [
 
 [[package]]
 name = "schema-parser"
-version = "0.2.3"
-source = { git = "https://github.com/socprime/detectflow-parser.git?tag=v0.2.3#a4964c46342427266177f015de37579ad8afab20" }
+version = "0.3.2"
+source = { git = "https://github.com/socprime/detectflow-parser.git?tag=v0.3.2#5d2e84cd203a986a4338920af9cbdf9ec877a4be" }
 dependencies = [
     { name = "flatten-dict" },
     { name = "orjson" },

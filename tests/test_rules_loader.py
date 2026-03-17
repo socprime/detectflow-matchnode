@@ -1,5 +1,3 @@
-import pytest
-
 from app.domain.rules.loader import load_sigmas_from_rules_data
 
 VALID_SIGMA_TEXT = """detection:
@@ -91,7 +89,7 @@ def test_load_rules_returns_empty_for_empty_input():
     assert load_sigmas_from_rules_data([]) == []
 
 
-def test_load_rules_raises_when_no_valid_sigmas():
+def test_load_rules_returns_empty_when_no_valid_sigmas():
     rules_data = [
         {
             "case": {"id": "rule-1", "name": "Rule 1"},
@@ -99,5 +97,4 @@ def test_load_rules_raises_when_no_valid_sigmas():
         }
     ]
 
-    with pytest.raises(ValueError, match="No valid rules loaded"):
-        load_sigmas_from_rules_data(rules_data)
+    assert load_sigmas_from_rules_data(rules_data) == []
