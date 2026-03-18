@@ -1,5 +1,5 @@
 # DetectFlow Match Node
-[![Version](https://img.shields.io/badge/version-0.9.2-blue.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](VERSION)
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3120/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.121.3-green.svg)](https://fastapi.tiangolo.com/)
 

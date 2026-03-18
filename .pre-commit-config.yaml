@@ -63,7 +63,7 @@ repos:
       # Import validation for critical modules
       - id: test-critical-imports
         name: Test critical imports
-        entry: bash -c 'uv run python -c "from app.operators.sigma_broadcast import SigmaMatcherBroadcastFunction; from app.domain.rules.loader import load_sigmas_from_tdm_dict; from app.connectors.kafka_source import create_kafka_source"'
+        entry: bash -c 'uv run python -c "from app.operators.sigma_broadcast import SigmaMatcherBroadcastFunction; from app.domain.rules.loader import load_sigmas_from_rules_data; from app.connectors.kafka_source import create_kafka_source"'
         language: system
         types: [python]
         pass_filenames: false

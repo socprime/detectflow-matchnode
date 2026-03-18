@@ -1,6 +1,7 @@
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
+from schema_parser.sigma_validation import SigmaValidator
 
 from app.config.logging import get_logger
 from app.domain.sigma_matcher.sigma_parser import Sigma, SigmaNotSupported
@@ -9,6 +10,16 @@ logger = get_logger(__name__)
 
 # Track unsupported rules to avoid logging duplicates on every window
 _logged_unsupported_rules: set[str] = set()
+
+# Module-level validator instance for pre-validation
+_validator = SigmaValidator()
+
+
+def _log_unsupported_rule_once(rule_key: str, reason: str) -> None:
+    """Log unsupported rule warning only once per rule."""
+    if rule_key not in _logged_unsupported_rules:
+        _logged_unsupported_rules.add(rule_key)
+        logger.warning("rule not supported", rule_key=rule_key, reason=reason)
 
 
 class CaseDict(BaseModel, extra="ignore"):
@@ -85,6 +96,15 @@ def load_sigmas_from_rules_data(rules_data: list[dict]) -> list[Sigma]:
                 error_count += 1
                 continue
 
+            # Pre-validate using schema_parser validator
+            validation_result = _validator.validate(rule.sigma.text)
+            if not validation_result.is_supported:
+                _log_unsupported_rule_once(
+                    rule.case.id, validation_result.unsupported_reason or "unknown"
+                )
+                unsupported_count += 1
+                continue
+
             sigma = Sigma(
                 text=rule.sigma.text,
                 case_id=rule.case.id,
@@ -96,17 +116,20 @@ def load_sigmas_from_rules_data(rules_data: list[dict]) -> list[Sigma]:
             sigmas.append(sigma)
 
         except SigmaNotSupported as e:
-            rule_key = rule.case.id
-            if rule_key and rule_key not in _logged_unsupported_rules:
-                logger.warning("rule not supported", rule_key=rule_key, reason=str(e))
-                _logged_unsupported_rules.add(rule_key)
+            # Sigma class raised SigmaNotSupported (secondary validation)
+            _log_unsupported_rule_once(rule.case.id if rule else "unknown", str(e))
             unsupported_count += 1
         except Exception as e:
             logger.exception("rule loading error", error=str(e))
             error_count += 1
 
     if rules_data and not sigmas:
-        raise ValueError("No valid rules loaded")
+        logger.warning(
+            "no valid sigma rules loaded; continuing with empty rules set",
+            input_rules_count=len(rules_data),
+            unsupported_count=unsupported_count,
+            error_count=error_count,
+        )
 
     logger.info(
         "rules loaded",

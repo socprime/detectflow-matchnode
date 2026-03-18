@@ -6,7 +6,6 @@ import polars as pl
 from schema_parser import ParserManager
 
 from app.config.logging import get_logger
-from app.config.settings import get_settings
 from app.domain.filters.loader import Filter
 from app.domain.sigma_matcher.constants import FULL_EVENT_COLUMN_NAME
 
@@ -29,8 +28,6 @@ class ProcessEventsResult(NamedTuple):
 
 
 logger = get_logger(__name__)
-
-conf = get_settings()
 
 
 def _flatten_dot(d: dict, prefix: str = "") -> dict[str, str]:
@@ -240,6 +237,13 @@ def process_events(
         rows=len(parsed_events),
         schema_parser_errors=schema_parser_errors,
     )
+
+    if not sigmas and not sigma_filters:
+        return ProcessEventsResult(
+            case_ids_per_event=[[] for _ in range(len(parsed_events))],
+            parsed_events=parsed_events,
+            schema_parser_errors=schema_parser_errors,
+        )
 
     df = prepare_df(events=parsed_events, used_fields=used_fields)
 

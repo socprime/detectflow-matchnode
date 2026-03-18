@@ -3,6 +3,7 @@ from typing import Literal, Union
 
 import yaml
 from pydantic import BaseModel
+from schema_parser.sigma_validation import SigmaNotSupported
 
 from .constants import FULL_EVENT_COLUMN_NAME
 from .core import InvertedSignature, Signature, SignatureGroup, SignatureNotValidException
@@ -14,10 +15,6 @@ from .utils import (
     parse_parentheses,
     sigma_detection_value_has_unescaped_wildcard,
 )
-
-
-class SigmaNotSupported(Exception):  # noqa: N818
-    pass
 
 
 class Condition(BaseModel, extra="forbid"):
