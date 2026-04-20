@@ -6,6 +6,7 @@ import polars as pl
 from schema_parser import ParserManager
 
 from app.config.logging import get_logger
+from app.config.settings import get_settings
 from app.domain.filters.loader import Filter
 from app.domain.sigma_matcher.constants import FULL_EVENT_COLUMN_NAME
 
@@ -28,6 +29,8 @@ class ProcessEventsResult(NamedTuple):
 
 
 logger = get_logger(__name__)
+
+conf = get_settings()
 
 
 def _flatten_dot(d: dict, prefix: str = "") -> dict[str, str]:

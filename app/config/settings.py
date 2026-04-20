@@ -175,34 +175,23 @@ class Settings(BaseSettings):
         description="Minimum pause between checkpoints in milliseconds",
     )
 
-    # Keying strategy for horizontal scaling
-    keying_strategy: Literal["hash", "computer", "round_robin"] = Field(
-        default="hash",
-        description=(
-            "Event keying strategy for distributing across parallel tasks:\n"
-            "  - hash: Hash-based distribution (recommended, fast, no JSON parsing)\n"
-            "  - computer: Key by Computer/hostname (legacy, requires JSON parsing)\n"
-            "  - round_robin: Simple round-robin (legacy, testing only)"
-        ),
-    )
-
-    # Key groups per task (affects number of unique keys and on_timer() calls)
-    # Higher values = better load balancing but more overhead from separate on_timer() calls
-    # Lower values = less overhead but larger batches = better matching efficiency
-    # Recommended: 1 for large rule sets (6400+ rules), 2-3 for smaller rule sets
+    # Controls bucket fan-out for parallel jobs. Each extra bucket creates its own keyed
+    # state and timer activity, so higher values improve distribution but increase overhead.
     key_groups_per_task: int = Field(
-        default=1,
+        default=3,
         ge=1,
         le=100,
         description=(
-            "Number of key groups per parallel task (default: 1)\n"
-            "Total buckets = parallelism × key_groups_per_task\n"
+            "Number of key groups per parallel task (default: 3)\n"
+            "Bucket heuristic:\n"
+            "  - parallelism=1 -> 1 bucket\n"
+            "  - parallelism>1 -> parallelism * key_groups_per_task buckets\n"
             "Each key group triggers separate on_timer() with separate rule matching.\n"
             "Trade-off:\n"
-            "  - Low (1): Larger batches, better matching efficiency for many rules\n"
-            "  - Medium (2-3): Balance between batch size and load distribution\n"
-            "  - High (10+): Better load distribution, but small batches = poor matching efficiency\n"
-            "Example: parallelism=6, key_groups_per_task=1 → 6 total key buckets"
+            "  - Low (1): Larger batches, lower on_timer() fan-out\n"
+            "  - Medium (2-3): More distribution headroom with moderate overhead\n"
+            "  - High (10+): Better load spreading, but small batches and more timer work\n"
+            "Example: parallelism=6, key_groups_per_task=3 -> 18 total key buckets"
         ),
     )
 

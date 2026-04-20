@@ -1,5 +1,6 @@
 FROM flink:2.2.0-scala_2.12-java17
 
+# Note: Version is read from pyproject.toml via importlib.metadata at runtime
 
 USER root
 
@@ -39,10 +40,12 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.24 /uv /uvx /bin/
 WORKDIR /opt/flink/usrlib
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies system-wide (no venv needed in container)
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --no-cache -r pyproject.toml
+# Copy application code (needed for package install)
+COPY app /opt/flink/usrlib/app
 
+# Install with [kubernetes] extra (apache-flink)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system --no-cache ".[kubernetes]"
 # Remove build-time dependencies after Python packages are installed
 RUN apt-get purge -y --auto-remove \
         libpython3.12-dev \
@@ -57,10 +60,8 @@ RUN apt-get purge -y --auto-remove \
 COPY lib/flink-sql-connector-kafka-4.0.1-2.0.jar /opt/flink/lib/
 
 ################################################################################
-# Copy application code
+# Copy additional files
 ################################################################################
-# Copy application code last for optimal cache invalidation
-COPY app /opt/flink/usrlib/app
 COPY log4j2.properties /opt/flink/usrlib/log4j2.properties
 
 ################################################################################

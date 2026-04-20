@@ -12,6 +12,8 @@ from typing import Any
 
 import structlog
 
+from app.config.version import get_version
+
 # Monkey-patch print() to ALWAYS ignore flush parameter
 # This is necessary because Flink's CustomPrint doesn't support it
 _original_print = builtins.print
@@ -39,6 +41,7 @@ def configure_logging(log_level: str = "INFO", log_format: str = "console") -> N
     - JSON output for log aggregation (production)
     - Integration with standard logging
     - Context variables support
+    - Application version bound to all logs
 
     Args:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
@@ -46,6 +49,8 @@ def configure_logging(log_level: str = "INFO", log_format: str = "console") -> N
             - "console": Human-readable colored output (default)
             - "json": JSON format for Fluent Bit, Elasticsearch, etc.
     """
+    # Bind version to all log entries (like structlog bound context)
+    structlog.contextvars.bind_contextvars(detectflow_matchnode_version=get_version())
     # Convert string level to logging constant
     numeric_level = getattr(logging, log_level.upper(), logging.INFO)
 
@@ -63,6 +68,8 @@ def configure_logging(log_level: str = "INFO", log_format: str = "console") -> N
 
     # Configure structlog processors
     shared_processors = [
+        # Merge context variables (like detectflow_matchnode_version) into log entries
+        structlog.contextvars.merge_contextvars,
         # Add log level
         structlog.stdlib.add_log_level,
         # Add logger name

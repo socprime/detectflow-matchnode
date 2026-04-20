@@ -11,7 +11,7 @@ from app.config.logging import configure_logging, get_logger
 from app.config.settings import Settings, get_settings
 from app.connectors.kafka_sink import create_kafka_sink
 from app.connectors.kafka_source import create_kafka_source
-from app.domain.keying.strategies import create_key_extractor
+from app.domain.keying.strategies import calculate_hash_bucket_count, create_hash_key_extractor
 from app.operators.sigma_broadcast import (
     METRICS_OUTPUT_TAG,
     RULES_STATE_DESCRIPTOR,
@@ -226,7 +226,6 @@ def log_kafka_configuration(settings: Settings) -> None:
         rules_starting_offset="earliest",  # Always earliest for compacted rules topic
         output_topic=settings.kafka_output_topic,
         window_size_seconds=settings.window_size_seconds,
-        keying_strategy=settings.keying_strategy,
     )
 
 
@@ -284,36 +283,42 @@ def build_pipeline(env: StreamExecutionEnvironment, settings: Settings) -> None:
     # IMPORTANT: Keying enables true horizontal scaling across parallel tasks
     # Each key will be processed by a separate task instance
     #
-    # Calculate number of buckets for hash-based keying:
-    # - Without autoscaler: parallelism × key_groups_per_task (minimal overhead)
-    # - With autoscaler: autoscaler_max_parallelism × key_groups_per_task (headroom for scaling)
+    # Calculate number of buckets for hash-based keying.
     #
-    # Trade-off: More buckets = better distribution when scaling, but more on_timer() overhead
+    # We size buckets from the effective target parallelism:
+    # - fixed mode: current job parallelism
+    # - autoscaler mode: autoscaler max parallelism (scaling headroom)
+    #
+    # Heuristic:
+    # - p=1 -> 1 bucket
+    # - p>1 -> p * key_groups_per_task buckets
+    #
+    # Trade-off: More buckets improve the chance of better distribution, but each
+    # bucket creates its own keyed state and timer activity in the matcher.
 
     if settings.autoscaler_enabled:
-        # Autoscaler enabled: pre-allocate buckets for max expected parallelism
-        num_buckets = settings.autoscaler_max_parallelism * settings.key_groups_per_task
+        target_parallelism = settings.autoscaler_max_parallelism
+        num_buckets = calculate_hash_bucket_count(target_parallelism, settings.key_groups_per_task)
         logger.info(
-            "keying strategy configured (autoscaler mode)",
-            strategy=settings.keying_strategy,
+            "hash keying configured (autoscaler mode)",
             initial_parallelism=settings.flink_parallelism,
             autoscaler_max_parallelism=settings.autoscaler_max_parallelism,
+            target_parallelism=target_parallelism,
             key_groups_per_task=settings.key_groups_per_task,
             total_key_buckets=num_buckets,
             scaling_headroom=f"up to parallelism={settings.autoscaler_max_parallelism}",
         )
     else:
-        # No autoscaler: use minimal buckets for current parallelism
-        num_buckets = settings.flink_parallelism * settings.key_groups_per_task
+        target_parallelism = settings.flink_parallelism
+        num_buckets = calculate_hash_bucket_count(target_parallelism, settings.key_groups_per_task)
         logger.info(
-            "keying strategy configured (fixed parallelism)",
-            strategy=settings.keying_strategy,
-            parallelism=settings.flink_parallelism,
+            "hash keying configured (fixed parallelism)",
+            parallelism=target_parallelism,
             key_groups_per_task=settings.key_groups_per_task,
             total_key_buckets=num_buckets,
         )
 
-    key_extractor = create_key_extractor(settings.keying_strategy, num_buckets=num_buckets)
+    key_extractor = create_hash_key_extractor(num_buckets)
 
     # Build event streams from all sources
     # Ref: .claude/docs/pyflink/pyflink/datastream/README.md - Union operator
@@ -424,6 +429,9 @@ def run_sigma_detection_job(
     output_mode: str | None = None,
     keep_filtered_events: bool | None = None,
     metrics_topic: str | None = None,
+    flink_parallelism: int | None = None,
+    kafka_source_parallelism: int | None = None,
+    window_size_seconds: int | None = None,
     apply_parser_to_output_events: bool | None = None,
 ) -> None:
     """
@@ -437,6 +445,9 @@ def run_sigma_detection_job(
         output_mode: "all_events" or "matched_only" (None = use settings default)
         keep_filtered_events: Keep prefiltered events in output (None = use settings default)
         metrics_topic: Kafka topic for per-rule metrics (None = disabled)
+        flink_parallelism: Parallelism for matcher and sink operators (None = use settings default)
+        kafka_source_parallelism: Parallelism for Kafka sources (None = use settings default)
+        window_size_seconds: Processing window size in seconds (None = use settings default)
         apply_parser_to_output_events: Apply parser to output events (None = use settings default)
 
     Settings defaults are used when CLI arguments are not provided.
@@ -457,6 +468,12 @@ def run_sigma_detection_job(
         settings.keep_filtered_events = keep_filtered_events
     if metrics_topic:
         settings.kafka_metrics_topic = metrics_topic
+    if flink_parallelism is not None:
+        settings.flink_parallelism = flink_parallelism
+    if kafka_source_parallelism is not None:
+        settings.kafka_source_parallelism = kafka_source_parallelism
+    if window_size_seconds is not None:
+        settings.window_size_seconds = window_size_seconds
     if apply_parser_to_output_events is not None:
         settings.apply_parser_to_output_events = apply_parser_to_output_events
 
