@@ -37,9 +37,8 @@ class TestSettings:
         assert settings.log_level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
         assert settings.log_format in ("console", "json")
 
-        # Test keying strategy defaults
-        assert settings.keying_strategy in ("hash", "computer", "round_robin")
         assert isinstance(settings.key_groups_per_task, int)
+        assert settings.key_groups_per_task == 3
         assert settings.key_groups_per_task >= 1
 
     def test_kafka_input_topics_list(self):

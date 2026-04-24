@@ -1,14 +1,14 @@
 [project]
 name = "detectflow-matchnode"
-version = "1.0.0"
+version = "1.1.0"
 description = "Real-time threat detection with Apache Flink and Sigma rules"
 requires-python = ">=3.10"
 authors = [
     {name = "Vladyslav Gumeniuk", email = "vladyslav.gumeniuk@socprime.com"}
 ]
 
+# Core dependencies (without PyFlink - provided by extras)
 dependencies = [
-    "apache-flink==2.2.0",
     "polars>=1.0.0",
     "PyYAML>=6.0.2",
     "orjson>=3.10.18",
@@ -18,6 +18,11 @@ dependencies = [
     "confluent-kafka>=2.12.1",
     "schema-parser",
 ]
+
+# PyFlink provider selection
+[project.optional-dependencies]
+kubernetes = ["apache-flink==2.2.0"]  # Standard Apache Flink (K8s Operator)
+confluent = ["cp-pyflink>=2.0.0"]     # Confluent's PyFlink (CMF)
 
 [project.scripts]
 flink-sigma-detector = "app.main:main"
@@ -40,7 +45,7 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
-schema-parser = { git = "https://github.com/socprime/detectflow-parser.git", tag = "v0.3.2" }
+schema-parser = { git = "https://github.com/socprime/detectflow-parser.git", tag = "v0.3.4" }
 
 [dependency-groups]
 dev = [

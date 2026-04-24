@@ -1,0 +1,84 @@
+# =============================================================================
+# Confluent Flink (CMF) Docker Image
+# =============================================================================
+#
+# Builds image for Confluent Manager for Apache Flink (CMF).
+#
+# Key differences from Kubernetes Dockerfile:
+#   - Base: confluentinc/cp-flink (not apache/flink)
+#   - PyFlink: cp-pyflink via [confluent] extra
+#   - Python: Standalone Python in venv (CMF requirement)
+#
+# Build:
+#   docker build -f Dockerfile.confluent -t flink-sigma-detector:cmf .
+#
+# =============================================================================
+
+# =============================================================================
+# Stage 1: Builder
+# =============================================================================
+FROM debian:bookworm-slim AS builder
+
+# Install build dependencies
+RUN set -ex; \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        python3-dev \
+        default-jdk \
+        git \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:0.5.24 /uv /uvx /bin/
+
+# Setup Python environment
+ENV UV_PYTHON_INSTALL_DIR=/opt/flink/pyflink/.python
+WORKDIR /opt/flink/pyflink
+
+RUN uv python install 3.11 && \
+    uv venv --python 3.11 --python-preference only-managed .venv
+
+# Copy project files
+COPY pyproject.toml uv.lock ./
+COPY app ./app
+
+# Install with [confluent] extra (cp-pyflink instead of apache-flink)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    . .venv/bin/activate && \
+    uv pip install --no-cache ".[confluent]"
+
+# Verify installation
+RUN . .venv/bin/activate && \
+    python -c "from importlib.metadata import version; v = version('detectflow-matchnode'); print(f'✓ detectflow-matchnode {v}')" && \
+    python -c "import pyflink; print(f'✓ pyflink {pyflink.__version__}')"
+
+# =============================================================================
+# Stage 2: Runtime
+# =============================================================================
+FROM confluentinc/cp-flink:2.0.0-cp1
+
+USER root
+
+# Copy Python environment from builder
+COPY --from=builder --chown=flink:flink /opt/flink/pyflink /opt/flink/pyflink
+
+# Copy Kafka connector and config
+COPY --chown=flink:flink lib/flink-sql-connector-kafka-4.0.1-2.0.jar /opt/flink/lib/
+COPY --chown=flink:flink log4j2.properties /opt/flink/pyflink/log4j2.properties
+
+# Create directories
+RUN mkdir -p /opt/flink/checkpoints /opt/flink/log && \
+    chown -R flink:flink /opt/flink/checkpoints /opt/flink/log /opt/flink/pyflink
+
+ENV PYTHONPATH="/opt/flink/pyflink:$PYTHONPATH" \
+    PYTHONUNBUFFERED=1
+
+USER flink
+WORKDIR /opt/flink
+
+EXPOSE 8081 6123

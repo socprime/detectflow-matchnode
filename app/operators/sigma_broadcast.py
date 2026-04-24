@@ -24,6 +24,7 @@ from pyflink.datastream.state import (
 )
 
 from app.config.logging import bind_context, get_logger
+from app.config.version import get_version
 from app.domain.filters.loader import Filter, convert_filter_kafka_event_to_filter
 from app.domain.logsources.loader import LogsourceConfig, convert_kafka_event_to_logsource_config
 from app.domain.rules.loader import load_sigmas_from_rules_data
@@ -277,13 +278,11 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         # Cumulative counters (for Kafka metrics consumer)
         self._matched_events_count = [0]
         self._total_events_count = [0]
-        # Output rate gauges - events ACTUALLY WRITTEN to output topic per second
-        # These are the PRIMARY metrics for dashboard (updated at end of each window)
-        # outputUntaggedPerSecond will be 0 if output_mode == "matched_only"
-        self._output_tagged_per_second = [0.0]
-        self._output_untagged_per_second = [0.0]
-        # Input EPS gauge - total input events per second (source of truth for EPS)
-        self._input_events_per_second = [0.0]
+        # Per-key rate gauges aggregated at instance level (sum across all keys)
+        # Updated at end of each window; gauge returns sum of all keys on this subtask
+        self._input_eps_per_key: dict[str, float] = {}
+        self._output_tagged_eps_per_key: dict[str, float] = {}
+        self._output_untagged_eps_per_key: dict[str, float] = {}
         # Error/processing counters (internal use only)
         self._event_parsing_errors_counter = None
         self._schema_parsing_errors_counter = None
@@ -295,9 +294,11 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         self._matching_duration_distribution = None
         # Mutable containers for gauge values (gauges need a callable)
         self._active_rules_count = [0]
+        # Init metric (job_id, instance_id, timestamp, version) sent once per instance
+        self._init_metric_sent = False
         self._prefiltered_events_count = [0]
-        # Timestamp of last processed window (for stale detection on backend)
-        self._last_window_timestamp_ms = [0]
+        # Per-key last window timestamp; gauge returns max (most recent) across keys
+        self._last_window_ts_per_key: dict[str, int] = {}
 
     def open(self, runtime_context):
         """Initialize with runtime context and managed state"""
@@ -322,8 +323,9 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             EARLY_FLUSH_TIMER_TS_STATE_DESCRIPTOR
         )
 
-        # Bind instance_id to all logs in this task
-        bind_context(instance_id=self._instance_id)
+        # Bind instance_id and version to all logs in this task
+        # Note: contextvars don't persist across processes, so we must bind in worker
+        bind_context(instance_id=self._instance_id, detectflow_matchnode_version=get_version())
 
         # Register custom Flink metrics (available via REST API at /jobs/{id}/vertices/{id}/subtasks/metrics)
         metrics_group = runtime_context.get_metrics_group()
@@ -334,24 +336,39 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         metrics_group.gauge("matchedEvents", lambda: self._matched_events_count[0])
         metrics_group.gauge("totalEvents", lambda: self._total_events_count[0])
 
-        # Output rate gauges - events ACTUALLY WRITTEN to output topic per second
-        # These are the PRIMARY metrics for dashboard display
-        # Updated at end of each window with: output_count / window_duration
-        # outputUntaggedPerSecond will be 0 if output_mode == "matched_only"
-        self._output_tagged_per_second = [0.0]
-        self._output_untagged_per_second = [0.0]
-        self._input_events_per_second = [0.0]
-        metrics_group.gauge("outputTaggedPerSecond", lambda: self._output_tagged_per_second[0])
-        metrics_group.gauge("outputUntaggedPerSecond", lambda: self._output_untagged_per_second[0])
-        metrics_group.gauge("inputEventsPerSecond", lambda: self._input_events_per_second[0])
+        # Per-key rate gauges: each on_timer writes its key's rate, gauge sums across all keys
+        # This correctly aggregates when multiple keys are assigned to one subtask
+        self._input_eps_per_key = {}
+        self._output_tagged_eps_per_key = {}
+        self._output_untagged_eps_per_key = {}
+        metrics_group.gauge(
+            "inputEventsPerSecond",
+            lambda: round(sum(self._input_eps_per_key.values()), 2),
+        )
+        metrics_group.gauge(
+            "outputTaggedPerSecond",
+            lambda: round(sum(self._output_tagged_eps_per_key.values()), 2),
+        )
+        metrics_group.gauge(
+            "outputUntaggedPerSecond",
+            lambda: round(sum(self._output_untagged_eps_per_key.values()), 2),
+        )
 
         # Prefiltered events counter (cumulative, like matchedEvents/totalEvents)
         self._prefiltered_events_count = [0]
         metrics_group.gauge("prefilteredEvents", lambda: self._prefiltered_events_count[0])
 
-        # Timestamp of last processed window (for stale detection on backend)
-        self._last_window_timestamp_ms = [0]
-        metrics_group.gauge("lastWindowTimestampMs", lambda: self._last_window_timestamp_ms[0])
+        # Per-key last window timestamp; gauge returns max (most recent) across all keys
+        self._last_window_ts_per_key = {}
+        metrics_group.gauge(
+            "lastWindowTimestampMs",
+            lambda: (
+                max(self._last_window_ts_per_key.values()) if self._last_window_ts_per_key else 0
+            ),
+        )
+
+        # Note: Version is sent via Kafka metrics (detectflow_matchnode_version field)
+        # PyFlink gauges only support integers, not strings
 
         # Error counters (keep as counters for internal use, not exposed via REST API)
         self._event_parsing_errors_counter = metrics_group.counter("eventParsingErrors")
@@ -378,6 +395,7 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         logger.info(
             "operator initialized",
             operator="SigmaMatcherBroadcastFunction",
+            detectflow_matchnode_version=get_version(),
             job_id=self.job_id,
             window_size_seconds=self.window_size_seconds,
             window_count_threshold=self.window_count_threshold,
@@ -479,6 +497,13 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             if not self._check_if_event_is_relevant_for_job(event):
                 return
 
+            # Emit init metric once per instance on first broadcast event.
+            if not self._init_metric_sent:
+                metric_json = self._build_init_metric_json()
+                if metric_json is not None:
+                    yield METRICS_OUTPUT_TAG, metric_json
+                    self._init_metric_sent = True
+
             if self._is_rule_event(event):
                 state = ctx.get_broadcast_state(RULES_STATE_DESCRIPTOR)
                 self._process_rule_event(event, state)
@@ -496,6 +521,24 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
 
         except Exception as e:
             logger.exception("Failed to process broadcast event", error=str(e))
+
+    def _build_init_metric_json(self) -> str | None:
+        try:
+            init_metric = {
+                "job_id": self.job_id,
+                "instance_id": self._instance_id,
+                "timestamp": int(time.time() * 1000),
+                "detectflow_matchnode_version": get_version(),
+            }
+            return orjson.dumps(init_metric).decode("utf-8")
+        except Exception as e:
+            logger.warning(
+                "init metric emit failed",
+                error=str(e),
+                job_id=self.job_id,
+                instance_id=self._instance_id,
+            )
+            return None
 
     def _check_if_event_is_relevant_for_job(self, event: dict) -> bool:
         return event.get("job_id") == self.job_id
@@ -902,7 +945,12 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         Pipeline: Events → Parse → Match → Enrich → Emit
         """
         metrics = WindowMetrics(timings=WindowTimings(on_timer_start=time.time()))
-        bind_context(key=ctx.get_current_key())
+        current_key = ctx.get_current_key()
+        bind_context(key=current_key)
+        early_flush_timer_ts = self._early_flush_timer_ts_state.value()
+        flushed_by_early_flush = (
+            early_flush_timer_ts is not None and timestamp == early_flush_timer_ts
+        )
 
         # ========== Parse events from state ==========
         metrics.timings.event_parsing.start = time.time()
@@ -975,23 +1023,21 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             window_start_ms / 1000.0 if window_start_ms else metrics.timings.on_timer_start
         )
 
-        # Update EPS gauges with REAL per-second values (rounded to 2 decimal places)
-        # These are the source of truth for dashboard EPS metrics
-        # outputUntaggedPerSecond will be 0 if output_mode == "matched_only"
+        # Update per-key EPS gauges (instance-level gauge = sum across all keys)
+        key = str(current_key)
         window_duration = metrics.timings.window_duration
         if window_duration > 0:
-            self._input_events_per_second[0] = round(metrics.total_events / window_duration, 2)
-            self._output_tagged_per_second[0] = round(metrics.output_tagged / window_duration, 2)
-            self._output_untagged_per_second[0] = round(
+            self._input_eps_per_key[key] = round(metrics.total_events / window_duration, 2)
+            self._output_tagged_eps_per_key[key] = round(metrics.output_tagged / window_duration, 2)
+            self._output_untagged_eps_per_key[key] = round(
                 metrics.output_untagged / window_duration, 2
             )
         else:
-            self._input_events_per_second[0] = 0.0
-            self._output_tagged_per_second[0] = 0.0
-            self._output_untagged_per_second[0] = 0.0
-
-        # Update last window timestamp for stale detection
-        self._last_window_timestamp_ms[0] = int(time.time() * 1000)
+            self._input_eps_per_key[key] = 0.0
+            self._output_tagged_eps_per_key[key] = 0.0
+            self._output_untagged_eps_per_key[key] = 0.0
+        # Update per-key last window timestamp (instance-level gauge = max across keys)
+        self._last_window_ts_per_key[key] = int(time.time() * 1000)
 
         # Update Flink metrics and log results
         self._update_flink_metrics(metrics)
@@ -999,13 +1045,28 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
 
         # Emit window metrics to Kafka (always when events were processed)
         if metrics.total_events > 0:
-            metric_json = self._create_metrics_from_window(metrics)
+            metric_json = self._create_metrics_from_window(
+                metrics,
+                current_key=current_key,
+                flushed_by_early_flush=flushed_by_early_flush,
+            )
             if metric_json:
                 yield METRICS_OUTPUT_TAG, metric_json
+        # Emit init metric once per instance on first window if it wasn't sent
+        elif not self._init_metric_sent:
+            metric_json = self._build_init_metric_json()
+            if metric_json is not None:
+                yield METRICS_OUTPUT_TAG, metric_json
+                self._init_metric_sent = True
 
         self._clear_window_state()
 
-    def _create_metrics_from_window(self, metrics: WindowMetrics) -> str | None:
+    def _create_metrics_from_window(
+        self,
+        metrics: WindowMetrics,
+        current_key: str,
+        flushed_by_early_flush: bool,
+    ) -> str | None:
         """
         Create per-rule metrics message for Kafka (consumed by admin-panel-backend).
 
@@ -1019,13 +1080,27 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             JSON metric string for admin-panel-backend, or None on error
         """
         sorted_rules = sorted(metrics.matched_rules.items(), key=lambda x: x[1], reverse=True)
+        window_start_timestamp = (
+            int(metrics.timings.window_start * 1000) if metrics.timings.window_start > 0 else None
+        )
+        window_on_timer_duration_ms = metrics.timings.event_parsing.duration_ms()
+        window_on_timer_duration_ms += metrics.timings.rules_loading.duration_ms()
+        window_on_timer_duration_ms += metrics.timings.rules_parsing.duration_ms()
+        window_on_timer_duration_ms += metrics.timings.matching.duration_ms()
+        window_on_timer_duration_ms += metrics.timings.enrichment_emit.duration_ms()
 
         metric = {
             # Identification
             "job_id": self.job_id,
             "instance_id": self._instance_id,
+            "key": str(current_key),
             "timestamp": int(time.time() * 1000),
+            "detectflow_matchnode_version": get_version(),
+            # Window metrics
             # Window metrics (essential for admin-panel)
+            "window_start_timestamp": window_start_timestamp,
+            "window_on_timer_duration_ms": window_on_timer_duration_ms,
+            "window_flushed_by_early_flush": flushed_by_early_flush,
             "window_total_events": metrics.total_events,
             "window_matched_events": metrics.matched_events,
             # Per-rule tracking (critical for pipeline_rule_metrics table)
