@@ -37,6 +37,9 @@ class Sigma:
         title: str | None = None,
         level: str | None = None,
         techniques: list[dict] | None = None,
+        sigma_uuid: str | None = None,
+        created: str | None = None,
+        updated: str | None = None,
     ):
         self._text = text
         self.case_id = case_id
@@ -47,6 +50,14 @@ class Sigma:
         self.level: str | None = level or self._dict.get("level")
         self.techniques: list[dict] = techniques or []
         self.technique_ids: list[str] = [t["id"] for t in self.techniques if t.get("id")]
+        self.sigma_uuid: str | None = sigma_uuid or self._get_sigma_id_from_yaml()
+        # Kafka rule-payload timestamps (RFC3339); used to pick primary_match.
+        self.created: str | None = created
+        self.updated: str | None = updated
+
+    def _get_sigma_id_from_yaml(self) -> str | None:
+        sigma_id = self._dict.get("id")
+        return sigma_id if isinstance(sigma_id, str) and sigma_id else None
 
     def __repr__(self):
         return f"Sigma(case_id={self.case_id}, level={self.level}, query={self.query})"

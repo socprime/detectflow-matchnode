@@ -11,8 +11,11 @@ RUN set -ex; apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
     git \
+    libjemalloc2 \
     libpython3.12-dev \
     gcc && \
+    jemalloc_path="$(find /usr/lib -name libjemalloc.so.2 -print -quit)" && \
+    ln -sf "${jemalloc_path}" /usr/lib/libjemalloc.so.2 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN set -ex; \
@@ -46,12 +49,30 @@ COPY app /opt/flink/usrlib/app
 # Install with [kubernetes] extra (apache-flink)
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system --no-cache ".[kubernetes]"
-# Remove build-time dependencies after Python packages are installed
-RUN apt-get purge -y --auto-remove \
+# Remove build-time dependencies after Python packages are installed.
+# Keep the libpython3.12 RUNTIME package: thread mode (Pemja) dlopens
+# libpython at TaskManager startup; --auto-remove of the -dev package alone
+# would drop the runtime .so and surface as a misleading
+# NoSuchFieldException(loadedLibraryNames) on JDK 17.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpython3.12 \
+    && apt-get purge -y --auto-remove \
         libpython3.12-dev \
         gcc \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# PyFlink 2.2.0 embedded-mode (thread) bug: in the KEYED_CO_BROADCAST_PROCESS
+# branch on_timer is the only path NOT wrapped in process_func(), so
+# side-output tuples (OutputTag, value) yielded from on_timer leak into the
+# main output and fail with ClassCastException (Object[] -> String).
+# Fixed here at image build; RuntimeContext TaskInfo patch stays in
+# app/operators/_pyflink_compat.py.
+RUN sed -i \
+    's/^            yield from on_timer(timestamp, timer_context)$/            yield from process_func(on_timer(timestamp, timer_context))/' \
+    /usr/local/lib/python3.12/dist-packages/pyflink/fn_execution/datastream/embedded/operations.py \
+    && grep -q "process_func(on_timer" \
+       /usr/local/lib/python3.12/dist-packages/pyflink/fn_execution/datastream/embedded/operations.py
 
 ################################################################################
 # Install Flink Kafka Connector
@@ -81,6 +102,9 @@ RUN mkdir -p \
 ################################################################################
 ENV PYTHONPATH="/opt/flink/usrlib:$PYTHONPATH"
 ENV PYTHONUNBUFFERED=1
+# polars[rtcompat] installs both builds, and Polars prefers compat when unset.
+# Keep the AVX2 build unless a deployment overrides this (old CPUs: compat).
+ENV POLARS_FORCE_PKG=32
 
 ################################################################################
 # Switch to flink user for security

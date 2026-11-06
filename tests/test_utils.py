@@ -2,6 +2,8 @@ import pytest
 
 from app.domain.sigma_matcher.utils import (
     create_wildcard_regex,
+    extract_hostname_from_sigma_event,
+    extract_timestamp_from_sigma_event,
     parse_parentheses,
     sigma_detection_value_has_unescaped_wildcard,
 )
@@ -100,3 +102,36 @@ def test_create_wildcard_regex_handles_handles_underscores():
     pattern = "abc_def"
     regex = create_wildcard_regex(pattern, strict_start=True, strict_end=True)
     assert regex == r"^abc_def$"
+
+
+def test_extract_hostname_from_sigma_event_uses_configured_fields():
+    event = {
+        "host": {"name": "host-01"},
+        "winlog": {"computer_name": "fallback-host"},
+    }
+
+    assert extract_hostname_from_sigma_event(event, ["winlog.computer_name"]) == "fallback-host"
+
+
+def test_extract_hostname_from_sigma_event_returns_none_without_configured_fields():
+    event = {"host": {"name": "host-01"}}
+
+    assert extract_hostname_from_sigma_event(event, None) is None
+
+
+def test_extract_timestamp_from_sigma_event_uses_configured_fields():
+    event = {
+        "@timestamp": "2026-05-19T10:00:00Z",
+        "winlog": {"time_created": "2026-05-19T11:22:33.456Z"},
+    }
+
+    assert (
+        extract_timestamp_from_sigma_event(event, ["winlog.time_created"])
+        == "2026-05-19T11:22:33.456Z"
+    )
+
+
+def test_extract_timestamp_from_sigma_event_returns_none_without_configured_fields():
+    event = {"@timestamp": "2026-05-19T10:00:00Z"}
+
+    assert extract_timestamp_from_sigma_event(event, None) is None

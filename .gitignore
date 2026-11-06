@@ -37,11 +37,3 @@ Thumbs.db
 # Project specific
 *.log
 logs/
-
-# Sigma rules data (large files, not versioned)
-scripts/sigmas.json
-events_cache.json
-
-# Performance test data (generated, large files)
-scripts/manual_testing/*.json
-scripts/manual_testing/events/

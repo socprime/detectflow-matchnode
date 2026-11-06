@@ -3,10 +3,73 @@ Unified Configuration using Pydantic Settings
 All environment variables loaded from .env file
 """
 
+from __future__ import annotations
+
+import json
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Hard cap on Kafka detection sinks / OutputTags per pipeline.
+MAX_OUTPUT_DESTINATIONS = 10
+
+OutputMode = Literal["all_events", "matched_only", "unmatched_only"]
+Severity = Literal["informational", "low", "medium", "high", "critical"]
+
+# Which events each output mode accepts, as (matched, unmatched). Single source of truth
+# for the emit filter — `unmatched_only` is exactly `all_events` minus the matches.
+OUTPUT_MODE_ACCEPTS: dict[str, tuple[bool, bool]] = {
+    "all_events": (True, True),
+    "matched_only": (True, False),
+    "unmatched_only": (False, True),
+}
+
+
+def destination_accepts(output_mode: str, matched: bool) -> bool:
+    """True when a destination in ``output_mode`` should receive a (un)matched event."""
+    accepts_matched, accepts_unmatched = OUTPUT_MODE_ACCEPTS[output_mode]
+    return accepts_matched if matched else accepts_unmatched
+
+
+class OutputDestination(BaseModel):
+    """One Kafka destination for detection output (per-topic mode/parser)."""
+
+    topic: str = Field(description="Kafka topic to write detection events to")
+    output_mode: OutputMode = Field(
+        default="matched_only",
+        description=(
+            "Output mode: 'all_events' (matched + unmatched), 'matched_only' (detections "
+            "only), or 'unmatched_only' (everything that matched no rule — all_events "
+            "minus the detections)"
+        ),
+    )
+    apply_parser_to_output_events: bool = Field(
+        default=False,
+        description="Apply parser to events written to this destination",
+    )
+    severities: frozenset[Severity] = Field(
+        default=frozenset(),
+        description=(
+            "matched_only only: Sigma levels a detection must have (any matching rule) to "
+            "reach this destination; empty = all. Ignored (cleared) for all_events and "
+            "unmatched_only, which always receive every event their mode accepts."
+        ),
+    )
+
+    @field_validator("topic")
+    @classmethod
+    def topic_non_empty(cls, v: str) -> str:
+        topic = v.strip()
+        if not topic:
+            raise ValueError("topic must be non-empty")
+        return topic
+
+    @model_validator(mode="after")
+    def severities_only_for_matched_only(self) -> OutputDestination:
+        if self.output_mode != "matched_only":
+            self.severities = frozenset()
+        return self
 
 
 class Settings(BaseSettings):
@@ -92,20 +155,44 @@ class Settings(BaseSettings):
     # Note: stored as str internally, parsed to list via validator
     # This avoids Pydantic Settings trying to parse as JSON from env vars
     kafka_input_topics: str = Field(
-        default="windows-events",
+        default="detectflow.events",
         description="Input Kafka topics for events (comma-separated for multiple topics)",
     )
     kafka_output_topic: str = Field(
-        default="windows-detections",
-        description="Output Kafka topic for detections",
+        default="detectflow.detections",
+        description=(
+            "Legacy single output Kafka topic for detections. "
+            "Used only when KAFKA_OUTPUT_DESTINATIONS is unset."
+        ),
+    )
+    # Stored as str to avoid Pydantic Settings auto-parsing JSON from env.
+    # Parse via get_output_destinations().
+    kafka_output_destinations: str = Field(
+        default="",
+        description=(
+            "JSON array of output destinations (max "
+            f"{MAX_OUTPUT_DESTINATIONS}): "
+            '[{"topic":"...","output_mode":"matched_only","apply_parser_to_output_events":false}]. '
+            "When set, overrides KAFKA_OUTPUT_TOPIC / OUTPUT_MODE / APPLY_PARSER_TO_OUTPUT_EVENTS."
+        ),
     )
     kafka_rules_topic: str = Field(
-        default="sigma-rules",
+        default="detectflow.sigma-rules",
         description="Kafka topic for Sigma rules updates",
     )
     kafka_metrics_topic: str = Field(
-        default="rule-statistics",
+        default="detectflow.rule-metrics",
         description="Kafka topic for per-rule metrics",
+    )
+    kafka_tagged_events_topic: str = Field(
+        default="",
+        description=(
+            "Kafka topic for the tagged-events side output, assigned PER PIPELINE by the "
+            "control plane (detectflow.tagged-events.<pipeline_id>). Empty disables the side "
+            "output and its sink entirely: no correlation pipeline consumes this pipeline. "
+            "Same convention as kafka_metrics_topic. The default is empty on purpose so a "
+            "deployment that loses the variable never falls back to a shared topic."
+        ),
     )
 
     # Consumer settings
@@ -117,6 +204,46 @@ class Settings(BaseSettings):
         default="latest",
         description="Kafka starting offset strategy",
     )
+    kafka_producer_compression_type: Literal["none", "gzip", "snappy", "lz4", "zstd"] = Field(
+        default="gzip",
+        description=(
+            "Compression codec for Flink Kafka sinks (detections output, tagged-events). "
+            "Default gzip is the current production behavior. Cross-repo A/B with detectflow-agent "
+            "showed gzip is Pareto-positive on Flink Java sinks (smaller payload → faster flush → "
+            "less I/O wait outweighs compression CPU); lz4 is cheaper CPU when the detections "
+            "producer writes several topics (compression still runs per topic-partition batch "
+            "on the task thread). zstd requires zstd-jni on the Flink classpath."
+        ),
+    )
+    kafka_producer_linger_ms: int = Field(
+        default=50,
+        ge=0,
+        description=(
+            "Kafka producer linger.ms for Flink sinks. Default 50ms batches records before send "
+            "(Kafka client default is 0). Improves compression ratio and cuts produce-request "
+            "rate — especially when the detections producer fans out to several topics. "
+            "Windowed detection latency (seconds) makes this delay negligible."
+        ),
+    )
+    kafka_producer_batch_size: int = Field(
+        default=262144,
+        ge=0,
+        description=(
+            "Kafka producer batch.size in bytes for Flink sinks (default 256 KiB; Kafka client "
+            "default is 16 KiB). Larger batches amortize produce RPCs and improve compression "
+            "when multi-destination fan-out multiplies output volume."
+        ),
+    )
+    kafka_producer_buffer_memory_mb: int = Field(
+        default=16,
+        ge=1,
+        le=512,
+        description=(
+            "Kafka producer buffer.memory per Flink sink writer, in MiB (default 16; Kafka "
+            "client default is 32). Cap matters because detections + tagged-events + metrics "
+            "each hold their own buffer on the TaskManager (detections are one sink for all topics)."
+        ),
+    )
 
     # ==========================================
     # MULTI-TENANCY CONFIGURATION
@@ -126,9 +253,12 @@ class Settings(BaseSettings):
         default="local",
         description="Unique job identifier for multi-tenancy (filters Sigma rules by job_id)",
     )
-    output_mode: Literal["all_events", "matched_only"] = Field(
+    output_mode: OutputMode = Field(
         default="matched_only",
-        description="Output mode: 'all_events' (all events with match status) or 'matched_only' (only matched events)",
+        description=(
+            "Legacy pipeline-wide output mode (shim for KAFKA_OUTPUT_DESTINATIONS). "
+            "'all_events', 'matched_only', or 'unmatched_only'."
+        ),
     )
     keep_filtered_events: bool = Field(
         default=False,
@@ -136,12 +266,34 @@ class Settings(BaseSettings):
     )
     apply_parser_to_output_events: bool = Field(
         default=False,
-        description="Apply parser to output events",
+        description=(
+            "Legacy pipeline-wide parser-on-output flag (shim for KAFKA_OUTPUT_DESTINATIONS)."
+        ),
+    )
+    matcher_engine: Literal["legacy", "fast"] = Field(
+        default="fast",
+        description=(
+            "Sigma matching engine. 'fast' = compile-once ruleset with sparse null-aware "
+            "DataFrame and per-column Aho-Corasick evaluation (~7-9x faster, identical "
+            "matches). 'legacy' = per-window polars expression tree (fallback)."
+        ),
     )
 
     # ==========================================
     # FLINK CONFIGURATION
     # ==========================================
+
+    python_execution_mode: Literal["process", "thread"] = Field(
+        default="process",
+        description=(
+            "PyFlink execution mode. 'process' (default, RECOMMENDED) runs Python UDFs in "
+            "separate worker processes — better isolation from the TaskManager JVM (avoids "
+            "Pemja/libpython native crashes under load). 'thread' embeds Python in the JVM "
+            "via Pemja (lower per-record overhead) but requires the image Dockerfile's "
+            "on_timer sed and is less stable under heavy matching. "
+            "Ref: .claude/docs/pyflink/ — python.execution-mode"
+        ),
+    )
 
     # Global parallelism (controls matcher and sink)
     flink_parallelism: int = Field(
@@ -149,6 +301,22 @@ class Settings(BaseSettings):
         ge=1,
         le=100,
         description="Parallelism for Sigma matcher and Kafka sink operators",
+    )
+
+    # Number of key groups (Flink maxParallelism). FALLBACK ONLY: used when the deployment does
+    # not set pipeline.max-parallelism (e.g. local / docker standalone). In the Kubernetes
+    # deployment the operator freezes pipeline.max-parallelism into the cluster config and every
+    # checkpoint; the job reads that value and does NOT override it, because a mismatch breaks
+    # last-state / savepoint restore. Must be >= flink_parallelism. Keep constant per pipeline.
+    flink_max_parallelism: int = Field(
+        default=256,
+        ge=1,
+        le=32768,
+        description=(
+            "Fallback Flink maxParallelism (number of key groups) used only when the deployment "
+            "does not set pipeline.max-parallelism. Must be >= FLINK_PARALLELISM. "
+            "Changing it invalidates existing savepoints."
+        ),
     )
 
     # Optional: override source parallelism when Kafka partitions < flink_parallelism
@@ -175,38 +343,32 @@ class Settings(BaseSettings):
         description="Minimum pause between checkpoints in milliseconds",
     )
 
-    # Controls bucket fan-out for parallel jobs. Each extra bucket creates its own keyed
-    # state and timer activity, so higher values improve distribution but increase overhead.
+    # Event keying (see app/domain/keying/strategies.py).
+    # - balanced (default): one evenly-filled bucket per subtask (LONG keys via Flink routing)
+    # - hash: legacy oversharding — parallelism × KEY_GROUPS_PER_TASK string buckets (hash-N)
+    # Switching strategy changes the keyed state space — do not restore a savepoint across modes.
+    keying_strategy: Literal["balanced", "hash"] = Field(
+        default="balanced",
+        description=(
+            "Event keying strategy:\n"
+            "  - balanced (default): one evenly-filled bucket per subtask; even load with a "
+            "single keyed window / on_timer() per subtask\n"
+            "  - hash: legacy multi-bucket-per-slot (parallelism × KEY_GROUPS_PER_TASK "
+            "hash-N string keys). More distribution headroom but smaller batches and more "
+            "timer/matching work per window"
+        ),
+    )
     key_groups_per_task: int = Field(
         default=3,
         ge=1,
         le=100,
         description=(
-            "Number of key groups per parallel task (default: 3)\n"
+            "Only used when KEYING_STRATEGY=hash.\n"
+            "Number of key groups per parallel task (default: 3).\n"
             "Bucket heuristic:\n"
             "  - parallelism=1 -> 1 bucket\n"
             "  - parallelism>1 -> parallelism * key_groups_per_task buckets\n"
-            "Each key group triggers separate on_timer() with separate rule matching.\n"
-            "Trade-off:\n"
-            "  - Low (1): Larger batches, lower on_timer() fan-out\n"
-            "  - Medium (2-3): More distribution headroom with moderate overhead\n"
-            "  - High (10+): Better load spreading, but small batches and more timer work\n"
             "Example: parallelism=6, key_groups_per_task=3 -> 18 total key buckets"
-        ),
-    )
-
-    # Autoscaler settings (passed from admin-panel)
-    autoscaler_enabled: bool = Field(
-        default=False,
-        description="Whether Flink autoscaler is enabled for this pipeline",
-    )
-    autoscaler_max_parallelism: int = Field(
-        default=24,
-        ge=1,
-        description=(
-            "Maximum parallelism for autoscaler (default: 24)\n"
-            "Only used when autoscaler_enabled=True.\n"
-            "Affects bucket calculation for hash keying."
         ),
     )
 
@@ -218,8 +380,8 @@ class Settings(BaseSettings):
         default="rocksdb",
         description=(
             "State backend for storing operator state:\n"
-            "  - memory: Heap-based (fast, but limited by JVM heap)\n"
-            "  - rocksdb: Disk-based embedded DB (supports large state, incremental checkpoints)"
+            "  - rocksdb: Disk-based embedded DB (default — incremental checkpoints, off-heap keyed state)\n"
+            "  - memory: Flink hashmap (heap ListState; local/sandbox or bounded experiments)"
         ),
     )
 
@@ -317,7 +479,7 @@ class Settings(BaseSettings):
         description="Time window size in seconds (for time-based windowing)",
     )
     window_count_threshold: int = Field(
-        default=20000,
+        default=10000,
         ge=1,
         description=(
             "Maximum buffered events per key before scheduling an immediate flush.\n"
@@ -418,6 +580,53 @@ class Settings(BaseSettings):
         Supports comma-separated format: 'topic1,topic2,topic3'
         """
         return [t.strip() for t in self.kafka_input_topics.split(",") if t.strip()]
+
+    def tagged_events_enabled(self) -> bool:
+        """True when the control plane assigned this pipeline a tagged-events topic.
+
+        Empty means no correlation pipeline consumes this detection pipeline, so the
+        side output is not built at all. Same convention as ``KAFKA_METRICS_TOPIC``.
+        """
+        return bool(self.kafka_tagged_events_topic and self.kafka_tagged_events_topic.strip())
+
+    def get_output_destinations(self) -> list[OutputDestination]:
+        """Resolve output destinations from JSON env or legacy single-topic shim.
+
+        Prefer ``KAFKA_OUTPUT_DESTINATIONS`` when set. Otherwise synthesize one
+        destination from ``KAFKA_OUTPUT_TOPIC`` / ``OUTPUT_MODE`` /
+        ``APPLY_PARSER_TO_OUTPUT_EVENTS``.
+        """
+        raw = (self.kafka_output_destinations or "").strip()
+        if raw:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"KAFKA_OUTPUT_DESTINATIONS is not valid JSON: {e}") from e
+            if not isinstance(data, list):
+                raise ValueError("KAFKA_OUTPUT_DESTINATIONS must be a JSON array")
+            destinations = [OutputDestination.model_validate(item) for item in data]
+            if not destinations:
+                raise ValueError("KAFKA_OUTPUT_DESTINATIONS must contain at least one destination")
+            if len(destinations) > MAX_OUTPUT_DESTINATIONS:
+                raise ValueError(
+                    f"KAFKA_OUTPUT_DESTINATIONS supports at most {MAX_OUTPUT_DESTINATIONS} "
+                    f"destinations (got {len(destinations)})"
+                )
+            topics = [d.topic for d in destinations]
+            if len(topics) != len(set(topics)):
+                raise ValueError("KAFKA_OUTPUT_DESTINATIONS contains duplicate topics")
+            return destinations
+
+        topic = (self.kafka_output_topic or "").strip()
+        if not topic:
+            raise ValueError("Either KAFKA_OUTPUT_DESTINATIONS or KAFKA_OUTPUT_TOPIC is required")
+        return [
+            OutputDestination(
+                topic=topic,
+                output_mode=self.output_mode,
+                apply_parser_to_output_events=self.apply_parser_to_output_events,
+            )
+        ]
 
     def get_kafka_base_config(self) -> dict[str, str]:
         """Get base Kafka configuration"""
@@ -541,13 +750,24 @@ class Settings(BaseSettings):
             "enable.auto.commit": "false",
         }
 
+    def get_kafka_flink_producer_properties(self) -> dict[str, str]:
+        """Producer knobs applied to every Flink ``KafkaSink`` (acks, compression, batching)."""
+        props: dict[str, str] = {
+            "acks": "all",
+            "linger.ms": str(self.kafka_producer_linger_ms),
+            "batch.size": str(self.kafka_producer_batch_size),
+            "buffer.memory": str(self.kafka_producer_buffer_memory_mb * 1024 * 1024),
+        }
+        if self.kafka_producer_compression_type != "none":
+            props["compression.type"] = self.kafka_producer_compression_type
+        return props
+
     def get_kafka_producer_config(self) -> dict[str, str]:
-        """Get complete Kafka producer configuration"""
+        """Get complete Kafka producer configuration (non-Flink clients / tooling)."""
         return {
             **self.get_kafka_base_config(),
             **self.get_kafka_auth_config(),
-            "acks": "all",
-            "compression.type": "gzip",
+            **self.get_kafka_flink_producer_properties(),
         }
 
 

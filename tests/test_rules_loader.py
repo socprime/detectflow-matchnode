@@ -59,6 +59,85 @@ def test_load_rules_allows_missing_tags():
     assert sigmas[0].technique_ids == []
 
 
+def test_load_rules_parses_sigma_uuid():
+    rules_data = [
+        {
+            "case": {"id": "rule-uuid", "name": "Rule with UUID"},
+            "sigma": {
+                "text": VALID_SIGMA_TEXT,
+                "level": "medium",
+                "sigma_uuid": "2f958f09-99cf-4af8-8d26-7de834541f07",
+            },
+        }
+    ]
+
+    sigmas = load_sigmas_from_rules_data(rules_data)
+
+    assert len(sigmas) == 1
+    assert sigmas[0].case_id == "rule-uuid"
+    assert sigmas[0].sigma_uuid == "2f958f09-99cf-4af8-8d26-7de834541f07"
+
+
+def test_load_rules_parses_created_and_updated():
+    rules_data = [
+        {
+            "case": {"id": "rule-dates", "name": "Rule with dates"},
+            "sigma": {
+                "text": VALID_SIGMA_TEXT,
+                "level": "medium",
+                "sigma_uuid": "2f958f09-99cf-4af8-8d26-7de834541f07",
+            },
+            "created": "2026-01-01T00:00:00Z",
+            "updated": "2026-01-02T00:00:00Z",
+        }
+    ]
+
+    sigmas = load_sigmas_from_rules_data(rules_data)
+
+    assert len(sigmas) == 1
+    assert sigmas[0].created == "2026-01-01T00:00:00Z"
+    assert sigmas[0].updated == "2026-01-02T00:00:00Z"
+
+
+def test_load_rules_allows_missing_created_and_updated():
+    rules_data = [
+        {
+            "case": {"id": "rule-1", "name": "Rule 1"},
+            "sigma": {"text": VALID_SIGMA_TEXT, "level": "medium"},
+        }
+    ]
+
+    sigmas = load_sigmas_from_rules_data(rules_data)
+
+    assert len(sigmas) == 1
+    assert sigmas[0].created is None
+    assert sigmas[0].updated is None
+
+
+def test_load_rules_uses_yaml_id_as_sigma_uuid_fallback():
+    sigma_with_yaml_id = """id: 95de6f76-4f72-4a53-90f2-89b7fd6624f9
+detection:
+  condition: selection
+  selection:
+    EventID: 4624
+"""
+    rules_data = [
+        {
+            "case": {"id": "rule-yaml-uuid", "name": "Rule with YAML UUID"},
+            "sigma": {
+                "text": sigma_with_yaml_id,
+                "level": "medium",
+            },
+        }
+    ]
+
+    sigmas = load_sigmas_from_rules_data(rules_data)
+
+    assert len(sigmas) == 1
+    assert sigmas[0].case_id == "rule-yaml-uuid"
+    assert sigmas[0].sigma_uuid == "95de6f76-4f72-4a53-90f2-89b7fd6624f9"
+
+
 def test_load_rules_allows_invalid_metadata_and_keeps_valid_core_fields():
     rules_data = [
         {

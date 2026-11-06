@@ -11,6 +11,7 @@ from app.domain.filters.loader import Filter
 from app.domain.sigma_matcher.constants import FULL_EVENT_COLUMN_NAME
 
 from .evaluator import Evaluator
+from .fast_evaluator import CompiledRuleset, FieldExtractor
 from .field_mapping import FieldMapping
 from .sigma_parser import Sigma, SigmaNotSupported
 
@@ -31,6 +32,71 @@ class ProcessEventsResult(NamedTuple):
 logger = get_logger(__name__)
 
 conf = get_settings()
+
+
+class _FastRulesCache:
+    """Per-process cache of the compiled rule-set for the fast matcher engine.
+
+    The operator already caches the parsed ``sigmas`` list across windows and
+    only rebuilds it when broadcast rules change, so identity of the list
+    object is a correct cache key.  A strong reference keeps the id stable.
+    Filters are NOT cached — they are few and their content can change
+    without an identity we can key on, so they are compiled per window.
+    """
+
+    def __init__(self) -> None:
+        self._key: tuple[int, int] | None = None
+        self._compiled: CompiledRuleset | None = None
+        # strong refs so cached ids cannot be recycled
+        self._refs: tuple | None = None
+
+    def get(self, sigmas: list[Sigma], field_mapping: FieldMapping) -> CompiledRuleset:
+        key = (id(sigmas), id(field_mapping))
+        if self._key == key and self._compiled is not None:
+            return self._compiled
+
+        t0 = time.time()
+        rule_fields: set[str] = set()
+        for s in sigmas:
+            rule_fields.update(s.get_event_fields(field_mapping))
+        compiled = CompiledRuleset(sigmas, field_mapping, rule_fields)
+        self._key = key
+        self._compiled = compiled
+        self._refs = (sigmas, field_mapping)
+        logger.info(
+            "fast engine compiled",
+            duration_seconds=round(time.time() - t0, 4),
+            rules=len(sigmas),
+            unique_atoms=len(compiled.atoms),
+        )
+        return compiled
+
+
+_fast_rules_cache = _FastRulesCache()
+
+
+class _RuleFieldsCache:
+    """Memoize the union of event fields used by the (operator-cached) rule list."""
+
+    def __init__(self) -> None:
+        self._key: tuple[int, int] | None = None
+        self._fields: set[str] | None = None
+        self._refs: tuple | None = None
+
+    def get(self, sigmas: list[Sigma], field_mapping: FieldMapping) -> set[str]:
+        key = (id(sigmas), id(field_mapping))
+        if self._key == key and self._fields is not None:
+            return self._fields
+        fields: set[str] = set()
+        for s in sigmas:
+            fields.update(s.get_event_fields(field_mapping))
+        self._key = key
+        self._fields = fields
+        self._refs = (sigmas, field_mapping)
+        return fields
+
+
+_rule_fields_cache = _RuleFieldsCache()
 
 
 def _flatten_dot(d: dict, prefix: str = "") -> dict[str, str]:
@@ -189,6 +255,29 @@ def prepare_df(events: list[dict], used_fields: list[str]) -> pl.DataFrame:
     return df
 
 
+def prepare_df_fast(events: list[dict], used_fields: list[str]) -> pl.DataFrame:
+    """Sparse, null-aware DataFrame for the fast engine (see fast_evaluator)."""
+    t0 = time.time()
+
+    if FULL_EVENT_COLUMN_NAME in used_fields:
+        for event in events:
+            event[FULL_EVENT_COLUMN_NAME] = orjson.dumps(event).decode()
+
+    df = FieldExtractor(used_fields).build_df(events)
+
+    if FULL_EVENT_COLUMN_NAME in used_fields:
+        for event in events:
+            event.pop(FULL_EVENT_COLUMN_NAME, None)
+
+    logger.debug(
+        "dataframe_prepared_fast",
+        duration_seconds=round(time.time() - t0, 4),
+        table_rows=len(df),
+        table_columns=len(df.columns),
+    )
+    return df
+
+
 def _convert_filters_to_sigmas(filters: list[Filter]) -> list[Sigma]:
     sigmas = []
     for f in filters:
@@ -223,9 +312,7 @@ def process_events(
 
     field_mapping = field_mapping or FieldMapping({})
 
-    used_fields = set()
-    for s in sigmas:
-        used_fields.update(s.get_event_fields(field_mapping))
+    used_fields = set(_rule_fields_cache.get(sigmas, field_mapping))
     for f in sigma_filters:
         used_fields.update(f.get_event_fields(field_mapping))
     used_fields = list(used_fields)
@@ -248,7 +335,12 @@ def process_events(
             schema_parser_errors=schema_parser_errors,
         )
 
-    df = prepare_df(events=parsed_events, used_fields=used_fields)
+    use_fast = conf.matcher_engine == "fast"
+
+    if use_fast:
+        df = prepare_df_fast(events=parsed_events, used_fields=used_fields)
+    else:
+        df = prepare_df(events=parsed_events, used_fields=used_fields)
 
     # Store original DataFrame info for result mapping
     original_length = df.height
@@ -256,7 +348,10 @@ def process_events(
     # Apply prefiltering if filters are present
     prefiltered_mask: list[bool] | None = None
     if sigma_filters:
-        filters_evaluator = Evaluator(sigmas=sigma_filters, field_mapping=field_mapping)
+        if use_fast:
+            filters_evaluator = CompiledRuleset(sigma_filters, field_mapping, set(used_fields))
+        else:
+            filters_evaluator = Evaluator(sigmas=sigma_filters, field_mapping=field_mapping)
         filtered_matches = filters_evaluator.evaluate(df)
         # True = event was excluded by a prefilter
         prefiltered_mask = [bool(match_list) for match_list in filtered_matches]
@@ -283,8 +378,10 @@ def process_events(
                 prefiltered_mask=prefiltered_mask,
             )
 
-    sigmas_evaluator = Evaluator(sigmas=sigmas, field_mapping=field_mapping)
-    matches = sigmas_evaluator.evaluate(df)
+    if use_fast:
+        matches = _fast_rules_cache.get(sigmas, field_mapping).evaluate(df)
+    else:
+        matches = Evaluator(sigmas=sigmas, field_mapping=field_mapping).evaluate(df)
 
     # Map results back to original DataFrame indices if prefiltering was applied
     if sigma_filters and df.height < original_length:

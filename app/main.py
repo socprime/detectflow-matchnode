@@ -21,8 +21,8 @@ def main():
 
     Supports multi-tenancy by accepting job-specific parameters:
     - job_id: Unique identifier for filtering rules
-    - input_topic/output_topic: Per-job Kafka topics
-    - output_mode: Control whether to emit all events or only matched
+    - input_topics / output destinations: Per-job Kafka topics
+    - Legacy output_topic / output_mode / apply_parser flags as shim
 
     These arguments override environment variables when provided.
     """
@@ -47,10 +47,20 @@ def main():
         help="Kafka topics with input events (comma-separated, e.g. 'topic1,topic2,topic3')",
     )
     parser.add_argument(
+        "--output-destinations",
+        type=str,
+        default=os.getenv("KAFKA_OUTPUT_DESTINATIONS"),
+        help=(
+            "JSON array of output destinations (max 10), e.g. "
+            '\'[{"topic":"detections","output_mode":"matched_only",'
+            '"apply_parser_to_output_events":false}]\''
+        ),
+    )
+    parser.add_argument(
         "--output-topic",
         type=str,
         default=os.getenv("KAFKA_OUTPUT_TOPIC"),
-        help="Kafka topic for output detections",
+        help="Legacy single Kafka topic for output detections (shim when --output-destinations unset)",
     )
     parser.add_argument(
         "--rules-topic",
@@ -65,13 +75,13 @@ def main():
         help="Kafka topic for per-rule metrics (optional, empty = disabled)",
     )
 
-    # Output behavior
+    # Output behavior (legacy shim when --output-destinations unset)
     parser.add_argument(
         "--output-mode",
         type=str,
-        choices=["all_events", "matched_only"],
+        choices=["all_events", "matched_only", "unmatched_only"],
         default=os.getenv("OUTPUT_MODE"),
-        help="Output all events or only matched events",
+        help="Legacy: all_events, matched_only, or unmatched_only",
     )
 
     parser.add_argument(
@@ -85,7 +95,7 @@ def main():
         "--apply-parser-to-output-events",
         action="store_true",
         default=os.getenv("APPLY_PARSER_TO_OUTPUT_EVENTS", "").lower() in ("true", "1"),
-        help="Apply parser to output events",
+        help="Legacy: apply parser to output events",
     )
 
     args = parser.parse_args()
@@ -95,8 +105,11 @@ def main():
         parser.error("--job-id is required (or set JOB_ID environment variable)")
     if not args.input_topics:
         parser.error("--input-topics is required (or set KAFKA_INPUT_TOPICS environment variable)")
-    if not args.output_topic:
-        parser.error("--output-topic is required (or set KAFKA_OUTPUT_TOPIC environment variable)")
+    if not (args.output_destinations or "").strip() and not args.output_topic:
+        parser.error(
+            "either --output-destinations (KAFKA_OUTPUT_DESTINATIONS) or "
+            "--output-topic (KAFKA_OUTPUT_TOPIC) is required"
+        )
 
     # Parse comma-separated topics into list
     input_topics = [t.strip() for t in args.input_topics.split(",") if t.strip()]
@@ -107,6 +120,7 @@ def main():
     run_sigma_detection_job(
         job_id=args.job_id,
         input_topics=input_topics,
+        output_destinations=args.output_destinations,
         output_topic=args.output_topic,
         rules_topic=args.rules_topic,
         output_mode=args.output_mode,
