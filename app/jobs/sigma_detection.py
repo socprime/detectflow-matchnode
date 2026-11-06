@@ -1,20 +1,30 @@
 """Sigma detection Flink job - Pipeline configuration and execution"""
 
+import json
 from datetime import timedelta
 from pathlib import Path
 
 from pyflink.common import Configuration, Types, WatermarkStrategy
 from pyflink.common.serialization import ByteArraySchema
 from pyflink.datastream import StreamExecutionEnvironment
+from pyflink.java_gateway import get_gateway
 
 from app.config.logging import configure_logging, get_logger
 from app.config.settings import Settings, get_settings
-from app.connectors.kafka_sink import create_kafka_sink
+from app.connectors.kafka_sink import create_kafka_sink, create_multi_topic_kafka_sink
 from app.connectors.kafka_source import create_kafka_source
-from app.domain.keying.strategies import calculate_hash_bucket_count, create_hash_key_extractor
+from app.domain.keying.strategies import (
+    calculate_hash_bucket_count,
+    compute_subtask_keys,
+    create_balanced_key_extractor,
+    create_hash_key_extractor,
+)
+from app.jobs.runtime_tuning import apply_companion_config
 from app.operators.sigma_broadcast import (
+    DETECTIONS_OUTPUT_TAG,
     METRICS_OUTPUT_TAG,
     RULES_STATE_DESCRIPTOR,
+    TAGGED_EVENTS_OUTPUT_TAG,
     SigmaMatcherBroadcastFunction,
 )
 
@@ -98,12 +108,11 @@ def configure_flink_environment(env: StreamExecutionEnvironment, settings: Setti
 
     configure_rest_api(config)
 
-    # Configure State Backend
+    # Configure State Backend (+ companion memory / checkpoint knobs)
     if settings.state_backend == "rocksdb":
         # RocksDB state backend with incremental checkpoints
         config.setString("state.backend.type", "rocksdb")
         config.setString("state.backend.rocksdb.localdir", "/tmp/flink-rocksdb")
-        config.setString("execution.checkpointing.incremental", "true")
 
         # RocksDB Performance Tuning
         # Write buffer: size before flushing to disk (default: 64MB)
@@ -138,7 +147,6 @@ def configure_flink_environment(env: StreamExecutionEnvironment, settings: Setti
         logger.info(
             "state backend configured",
             backend="rocksdb",
-            incremental=True,
             localdir="/tmp/flink-rocksdb",
             writebuffer_size_mb=settings.rocksdb_writebuffer_size_mb,
             writebuffer_count=settings.rocksdb_writebuffer_count,
@@ -148,9 +156,14 @@ def configure_flink_environment(env: StreamExecutionEnvironment, settings: Setti
             thread_num=settings.rocksdb_thread_num,
         )
     else:
-        # Use default hashmap state backend (in-memory)
+        # Hashmap state backend (in-memory heap ListState; no incremental checkpoints)
         config.setString("state.backend.type", "hashmap")
-        logger.info("state backend configured", backend="hashmap", incremental=False)
+        logger.info("state backend configured", backend="hashmap")
+
+    # Managed fraction, incremental checkpoints, jvm-overhead, network buffers — follow
+    # STATE_BACKEND + PYTHON_EXECUTION_MODE so flipping either switch keeps memory coherent.
+    # Ref: app/jobs/runtime_tuning.py
+    apply_companion_config(config, settings)
 
     # Configure Checkpoint Storage
     config.setString("state.checkpoints.dir", settings.checkpoint_path)
@@ -158,7 +171,43 @@ def configure_flink_environment(env: StreamExecutionEnvironment, settings: Setti
 
     # Configure Parallelism
     env.set_parallelism(settings.flink_parallelism)
-    logger.info("parallelism configured", parallelism=settings.flink_parallelism)
+
+    # Number of key groups (maxParallelism). The deterministic keying (see build_pipeline) routes
+    # exactly one balanced bucket per subtask using Flink's KeyGroupRangeAssignment, which needs
+    # the SAME maxParallelism the keyed operator actually runs with.
+    #
+    # In production the Kubernetes operator freezes pipeline.max-parallelism in the cluster config
+    # (and into every checkpoint). We MUST NOT override it here: forcing a different value makes
+    # last-state / savepoint restore fail with a "Max parallelism mismatch", and the operator then
+    # tears down and redeploys the cluster in a loop. So we only set it ourselves when the
+    # deployment did not (e.g. local / docker standalone), keeping keying deterministic there.
+    configured_max_parallelism = config.getString("pipeline.max-parallelism", None)
+    if configured_max_parallelism is not None:
+        max_parallelism = int(configured_max_parallelism)
+        logger.info(
+            "max parallelism from cluster config",
+            max_parallelism=max_parallelism,
+            note="pipeline.max-parallelism set by deployment; not overriding",
+        )
+    else:
+        max_parallelism = settings.flink_max_parallelism
+        env.set_max_parallelism(max_parallelism)
+        logger.info(
+            "max parallelism set from settings",
+            max_parallelism=max_parallelism,
+            source="FLINK_MAX_PARALLELISM",
+        )
+
+    if max_parallelism < settings.flink_parallelism:
+        raise ValueError(
+            f"maxParallelism ({max_parallelism}) must be >= "
+            f"flink_parallelism ({settings.flink_parallelism})"
+        )
+    logger.info(
+        "parallelism configured",
+        parallelism=settings.flink_parallelism,
+        max_parallelism=max_parallelism,
+    )
 
     # Configure Checkpointing
     env.enable_checkpointing(settings.flink_checkpoint_interval_ms)
@@ -215,6 +264,7 @@ def create_watermark_strategy(settings):
 def log_kafka_configuration(settings: Settings) -> None:
     """Log Kafka configuration for visibility"""
     input_topics_list = settings.get_input_topics_list()
+    destinations = settings.get_output_destinations()
     logger.info(
         "kafka configuration",
         events_topics=input_topics_list,
@@ -224,7 +274,17 @@ def log_kafka_configuration(settings: Settings) -> None:
         rules_topic=settings.kafka_rules_topic,
         rules_consumer_group=f"{settings.kafka_consumer_group}-rules",
         rules_starting_offset="earliest",  # Always earliest for compacted rules topic
-        output_topic=settings.kafka_output_topic,
+        output_destinations=[
+            {
+                "topic": d.topic,
+                "output_mode": d.output_mode,
+                "apply_parser_to_output_events": d.apply_parser_to_output_events,
+                "severities": sorted(d.severities),
+            }
+            for d in destinations
+        ],
+        tagged_output_topic=settings.kafka_tagged_events_topic or None,
+        tagged_events_enabled=settings.tagged_events_enabled(),
         window_size_seconds=settings.window_size_seconds,
     )
 
@@ -272,9 +332,29 @@ def build_pipeline(env: StreamExecutionEnvironment, settings: Settings) -> None:
     )
     logger.info("kafka source created", source_type="rules", topic=settings.kafka_rules_topic)
 
-    # Create Kafka sinks
-    kafka_sink = create_kafka_sink(settings, settings.kafka_output_topic)
-    logger.info("kafka sink created", topic=settings.kafka_output_topic)
+    destinations = settings.get_output_destinations()
+    if (settings.kafka_output_destinations or "").strip():
+        logger.warning(
+            "KAFKA_OUTPUT_DESTINATIONS is set; ignoring legacy "
+            "KAFKA_OUTPUT_TOPIC / OUTPUT_MODE / APPLY_PARSER_TO_OUTPUT_EVENTS"
+        )
+
+    # One detections KafkaSink for every destination (topic selector on ROW<topic, json>).
+    # Tagged-events / metrics stay fixed-topic — different schemas and volumes.
+    detections_sink = create_multi_topic_kafka_sink(settings)
+    for dest in destinations:
+        logger.info(
+            "kafka destination registered",
+            topic=dest.topic,
+            output_mode=dest.output_mode,
+            apply_parser_to_output_events=dest.apply_parser_to_output_events,
+        )
+    logger.info(
+        "kafka detections sink created",
+        destination_count=len(destinations),
+        topics=[d.topic for d in destinations],
+    )
+    emit_tagged_events = settings.tagged_events_enabled()
 
     # Create watermark strategy
     watermark_strategy = create_watermark_strategy(settings)
@@ -283,42 +363,44 @@ def build_pipeline(env: StreamExecutionEnvironment, settings: Settings) -> None:
     # IMPORTANT: Keying enables true horizontal scaling across parallel tasks
     # Each key will be processed by a separate task instance
     #
-    # Calculate number of buckets for hash-based keying.
-    #
-    # We size buckets from the effective target parallelism:
-    # - fixed mode: current job parallelism
-    # - autoscaler mode: autoscaler max parallelism (scaling headroom)
-    #
-    # Heuristic:
-    # - p=1 -> 1 bucket
-    # - p>1 -> p * key_groups_per_task buckets
-    #
-    # Trade-off: More buckets improve the chance of better distribution, but each
-    # bucket creates its own keyed state and timer activity in the matcher.
+    # KEYING_STRATEGY selects the extractor (see app/domain/keying/strategies.py):
+    # - balanced (default): one evenly-filled LONG bucket per subtask via Flink routing
+    # - hash: legacy oversharding — parallelism × KEY_GROUPS_PER_TASK string keys (hash-N)
+    # Do not restore a savepoint across strategies (keyed state space differs).
+    parallelism = settings.flink_parallelism
+    keying_strategy = settings.keying_strategy
 
-    if settings.autoscaler_enabled:
-        target_parallelism = settings.autoscaler_max_parallelism
-        num_buckets = calculate_hash_bucket_count(target_parallelism, settings.key_groups_per_task)
+    if keying_strategy == "hash":
+        num_buckets = calculate_hash_bucket_count(parallelism, settings.key_groups_per_task)
+        key_extractor = create_hash_key_extractor(num_buckets)
         logger.info(
-            "hash keying configured (autoscaler mode)",
-            initial_parallelism=settings.flink_parallelism,
-            autoscaler_max_parallelism=settings.autoscaler_max_parallelism,
-            target_parallelism=target_parallelism,
+            "hash keying configured",
+            strategy="hash",
+            parallelism=parallelism,
             key_groups_per_task=settings.key_groups_per_task,
             total_key_buckets=num_buckets,
-            scaling_headroom=f"up to parallelism={settings.autoscaler_max_parallelism}",
         )
     else:
-        target_parallelism = settings.flink_parallelism
-        num_buckets = calculate_hash_bucket_count(target_parallelism, settings.key_groups_per_task)
-        logger.info(
-            "hash keying configured (fixed parallelism)",
-            parallelism=target_parallelism,
-            key_groups_per_task=settings.key_groups_per_task,
-            total_key_buckets=num_buckets,
+        # Use the SAME maxParallelism the keyed operator will actually run with.
+        # configure_flink_environment resolves it from pipeline.max-parallelism (frozen by the
+        # deployment) or FLINK_MAX_PARALLELISM (local).
+        config = env._j_stream_execution_environment.getConfiguration()
+        configured_max_parallelism = config.getString("pipeline.max-parallelism", None)
+        max_parallelism = (
+            int(configured_max_parallelism)
+            if configured_max_parallelism is not None
+            else settings.flink_max_parallelism
         )
-
-    key_extractor = create_hash_key_extractor(num_buckets)
+        subtask_keys = compute_subtask_keys(get_gateway(), parallelism, max_parallelism)
+        key_extractor = create_balanced_key_extractor(subtask_keys)
+        logger.info(
+            "balanced keying configured",
+            strategy="balanced",
+            parallelism=parallelism,
+            max_parallelism=max_parallelism,
+            buckets=len(subtask_keys),
+            subtask_keys=subtask_keys,
+        )
 
     # Build event streams from all sources
     # Ref: .claude/docs/pyflink/pyflink/datastream/README.md - Union operator
@@ -342,8 +424,13 @@ def build_pipeline(env: StreamExecutionEnvironment, settings: Settings) -> None:
             stream_count=len(event_streams),
         )
 
-    # Key the combined stream for parallel processing
-    events_stream = combined_events_stream.key_by(key_extractor)
+    # Key the combined stream for parallel processing.
+    # balanced: key_type=LONG so routing keys match compute_subtask_keys (Row(Long)).
+    # hash: default string keys (hash-N).
+    if keying_strategy == "hash":
+        events_stream = combined_events_stream.key_by(key_extractor)
+    else:
+        events_stream = combined_events_stream.key_by(key_extractor, key_type=Types.LONG())
     # Note: KeyedStream doesn't support .name() - name is set on source
 
     # Build rules broadcast stream
@@ -363,39 +450,62 @@ def build_pipeline(env: StreamExecutionEnvironment, settings: Settings) -> None:
 
     # Connect streams with KeyedBroadcastProcessFunction
     # Keyed events stream + broadcast rules stream
+    matcher_fn = SigmaMatcherBroadcastFunction(
+        window_size_seconds=settings.window_size_seconds,
+        window_count_threshold=settings.window_count_threshold,
+        job_id=settings.job_id,
+        destinations=destinations,
+        keep_filtered_events=settings.keep_filtered_events,
+        emit_tagged_events=emit_tagged_events,
+    )
     combined_stream = (
         events_stream.connect(rules_stream)
         .process(
-            SigmaMatcherBroadcastFunction(
-                window_size_seconds=settings.window_size_seconds,
-                window_count_threshold=settings.window_count_threshold,
-                job_id=settings.job_id,
-                output_mode=settings.output_mode,
-                keep_filtered_events=settings.keep_filtered_events,
-                apply_parser_to_output_events=settings.apply_parser_to_output_events,
-            ),
+            matcher_fn,
             output_type=Types.STRING(),
         )
         .set_parallelism(settings.flink_parallelism)
         .name("Sigma Detection Processor")
     )
 
-    # Sink detections to Kafka
+    # Sink detections to Kafka (one producer; topic comes from ROW field 0)
     (
-        combined_stream.sink_to(kafka_sink)
+        combined_stream.get_side_output(DETECTIONS_OUTPUT_TAG)
+        .sink_to(detections_sink)
         .set_parallelism(settings.flink_parallelism)
         .name("Detections Output (Kafka)")
     )
-
-    # Sink per-rule metrics to Kafka (if metrics topic is configured)
-    sinks = ["kafka_detections"]
+    sinks = [f"kafka_detections:{d.topic}" for d in destinations]
     parallelism_config = {
         "kafka_source": settings.kafka_source_parallelism or settings.flink_parallelism,
         "sigma_matcher": settings.flink_parallelism,
         "kafka_sink": settings.flink_parallelism,
         "rules_source": 1,
+        "detections_sinks": 1,
+        "destination_topics": len(destinations),
     }
 
+    # Tagged-events side output -> correlation. Skipped entirely (branch + sink)
+    # when the control plane left KAFKA_TAGGED_EVENTS_TOPIC empty.
+    if emit_tagged_events:
+        tagged_events_sink = create_kafka_sink(settings, settings.kafka_tagged_events_topic)
+        logger.info("kafka tagged events sink created", topic=settings.kafka_tagged_events_topic)
+        (
+            combined_stream.get_side_output(TAGGED_EVENTS_OUTPUT_TAG)
+            .sink_to(tagged_events_sink)
+            .set_parallelism(settings.flink_parallelism)
+            .name("Tagged Events Output (Kafka)")
+        )
+        sinks.append("kafka_tagged_events")
+        parallelism_config["tagged_events_sink"] = settings.flink_parallelism
+    else:
+        logger.info(
+            "tagged events sink skipped",
+            reason="KAFKA_TAGGED_EVENTS_TOPIC is empty",
+            note="pipeline is not consumed by any correlation pipeline",
+        )
+
+    # Sink per-rule metrics to Kafka (if metrics topic is configured)
     if settings.kafka_metrics_topic:
         metrics_sink = create_kafka_sink(settings, settings.kafka_metrics_topic)
         logger.info("kafka metrics sink created", topic=settings.kafka_metrics_topic)
@@ -424,7 +534,8 @@ def build_pipeline(env: StreamExecutionEnvironment, settings: Settings) -> None:
 def run_sigma_detection_job(
     job_id: str,
     input_topics: list[str],
-    output_topic: str,
+    output_topic: str | None = None,
+    output_destinations: str | list | None = None,
     rules_topic: str | None = None,
     output_mode: str | None = None,
     keep_filtered_events: bool | None = None,
@@ -440,15 +551,16 @@ def run_sigma_detection_job(
     Args:
         job_id: Unique job identifier for rule filtering (multi-tenancy)
         input_topics: List of Kafka topics with input events (will be unioned)
-        output_topic: Kafka topic for output (matched events or all)
+        output_topic: Legacy single Kafka output topic (shim when destinations unset)
+        output_destinations: JSON string or list of destination dicts (preferred)
         rules_topic: Kafka topic with Sigma rules (None = use settings default)
-        output_mode: "all_events" or "matched_only" (None = use settings default)
+        output_mode: Legacy "all_events" / "matched_only" / "unmatched_only" (shim when destinations unset)
         keep_filtered_events: Keep prefiltered events in output (None = use settings default)
         metrics_topic: Kafka topic for per-rule metrics (None = disabled)
         flink_parallelism: Parallelism for matcher and sink operators (None = use settings default)
         kafka_source_parallelism: Parallelism for Kafka sources (None = use settings default)
         window_size_seconds: Processing window size in seconds (None = use settings default)
-        apply_parser_to_output_events: Apply parser to output events (None = use settings default)
+        apply_parser_to_output_events: Legacy parser-on-output flag (shim when destinations unset)
 
     Settings defaults are used when CLI arguments are not provided.
     """
@@ -458,7 +570,13 @@ def run_sigma_detection_job(
     # Override settings from CLI arguments (only if explicitly provided)
     settings.job_id = job_id
     settings.kafka_input_topics = ",".join(input_topics)
-    settings.kafka_output_topic = output_topic
+    if output_destinations is not None:
+        if isinstance(output_destinations, list):
+            settings.kafka_output_destinations = json.dumps(output_destinations)
+        else:
+            settings.kafka_output_destinations = output_destinations
+    if output_topic:
+        settings.kafka_output_topic = output_topic
 
     if rules_topic:
         settings.kafka_rules_topic = rules_topic
@@ -476,6 +594,9 @@ def run_sigma_detection_job(
         settings.window_size_seconds = window_size_seconds
     if apply_parser_to_output_events is not None:
         settings.apply_parser_to_output_events = apply_parser_to_output_events
+
+    # Fail fast on invalid destination config before building the Flink graph
+    settings.get_output_destinations()
 
     # Setup structured logging
     configure_logging(
@@ -498,15 +619,15 @@ def run_sigma_detection_job(
     # - In cluster: Flink cluster with JobManager + TaskManager (docker)
     conf = Configuration()
 
-    # Python execution mode: use process mode for better parallelism
-    # Process mode runs Python workers in separate processes on TaskManagers
-    # This provides better isolation and true parallelism (avoids GIL limitations)
-    conf.set_string("python.execution-mode", "process")
+    # Python execution mode (settings.python_execution_mode):
+    # - "process" (default, RECOMMENDED): separate Python worker processes (isolation)
+    # - "thread": Python embedded in TaskManager JVM via Pemja (lower overhead; less
+    #   stable under load — see Dockerfile on_timer sed + native crash risk)
+    conf.set_string("python.execution-mode", settings.python_execution_mode)
     logger.info(
         "flink environment created",
         mode="APPLICATION",
-        python_mode="process",
-        note="Python workers run in separate processes for better parallelism",
+        python_mode=settings.python_execution_mode,
     )
 
     env = StreamExecutionEnvironment.get_execution_environment(conf)

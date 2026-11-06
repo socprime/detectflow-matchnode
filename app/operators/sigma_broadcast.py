@@ -9,10 +9,12 @@ import hashlib
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import NamedTuple
 
 import orjson
 import yaml
+from pyflink.common import Row
 from pyflink.common.typeinfo import Types
 from pyflink.datastream import OutputTag
 from pyflink.datastream.functions import KeyedBroadcastProcessFunction
@@ -24,14 +26,44 @@ from pyflink.datastream.state import (
 )
 
 from app.config.logging import bind_context, get_logger
+from app.config.settings import MAX_OUTPUT_DESTINATIONS, OutputDestination, destination_accepts
 from app.config.version import get_version
 from app.domain.filters.loader import Filter, convert_filter_kafka_event_to_filter
 from app.domain.logsources.loader import LogsourceConfig, convert_kafka_event_to_logsource_config
 from app.domain.rules.loader import load_sigmas_from_rules_data
 from app.domain.sigma_matcher.helpers import process_events
 from app.domain.sigma_matcher.sigma_parser import Sigma
+from app.domain.sigma_matcher.utils import (
+    _format_rfc3339_utc,
+    _parse_timestamp_to_utc_datetime,
+    extract_hostname_from_sigma_event,
+    extract_timestamp_from_sigma_event,
+)
+from app.operators._pyflink_compat import apply_thread_mode_patches
+
+# PyFlink 2.2.0 embedded (thread) mode still calls removed Java RuntimeContext
+# methods; patch to TaskInfo when thread mode is used. Default is process mode.
+# on_timer side-output routing for thread mode is fixed in the Dockerfile sed.
+apply_thread_mode_patches()
 
 logger = get_logger(__name__)
+
+# Sigma levels, lowest → highest. Unknown / missing severity ranks below all of these.
+_SEVERITY_RANK = {
+    "informational": 0,
+    "info": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
+_MISSING_UPDATED = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _canonical_level(level: str | None) -> str:
+    """Rule level as matched against ``OutputDestination.severities`` (``info`` alias folded)."""
+    level = (level or "").lower()
+    return "informational" if level == "info" else level
 
 
 # ============================================================================
@@ -119,8 +151,9 @@ class WindowMetrics:
     matched_events: int = 0
     rule_count: int = 0
 
-    # Output counts - events ACTUALLY written to output topic
-    # output_untagged will be 0 if output_mode == "matched_only"
+    # Output counts - events ACTUALLY written to at least one destination (counted once
+    # per event, never multiplied by fan-out). output_tagged is 0 when every destination is
+    # unmatched_only; output_untagged is 0 when every destination is matched_only.
     output_tagged: int = 0
     output_untagged: int = 0
     prefiltered_events: int = 0
@@ -218,6 +251,54 @@ CUSTOM_FIELDS_STATE_DESCRIPTOR = MapStateDescriptor(
 
 # Side output tag for per-rule metrics (to Kafka metrics topic)
 METRICS_OUTPUT_TAG = OutputTag("metrics", Types.STRING())
+TAGGED_EVENTS_OUTPUT_TAG = OutputTag("tagged-events", Types.STRING())
+# All pipeline destinations share one side output: ROW<topic, json> → one KafkaSink.
+DETECTIONS_ROW_TYPE = Types.ROW([Types.STRING(), Types.STRING()])
+DETECTIONS_OUTPUT_TAG = OutputTag("detections", DETECTIONS_ROW_TYPE)
+
+# Reserved MapState key holding the JSON array of entry ids in the same state.
+# Thread mode (Pemja) exposes broadcast state as a raw Java proxy with no
+# .keys()/.items() iteration — only get/put/remove are safe in both execution
+# modes. The index is maintained incrementally on every broadcast event, so
+# reading all rules/filters never needs to iterate the state. Rule ids are
+# case UUIDs and filter ids are backend-generated, so this key cannot collide.
+STATE_INDEX_KEY = "__entry_ids__"
+
+
+def _read_state_index(state: BroadcastState) -> list[str]:
+    """Read the id index maintained next to the entries (see STATE_INDEX_KEY).
+
+    Falls back to native iteration for state written before the index existed
+    (e.g. restored from an old checkpoint); the fallback is process-mode only.
+    """
+    raw = state.get(STATE_INDEX_KEY)
+    if raw:
+        try:
+            ids = orjson.loads(raw)
+            if isinstance(ids, list):
+                return ids
+        except Exception:
+            logger.warning("corrupt state index, falling back to iteration")
+    try:
+        return [k for k in state.keys() if k != STATE_INDEX_KEY]  # noqa: SIM118
+    except Exception:
+        # Thread mode without an index (old checkpoint): nothing we can list.
+        logger.error("state index missing and iteration unsupported (thread mode)")
+        return []
+
+
+def _index_add(state: BroadcastState, entry_id: str) -> None:
+    ids = _read_state_index(state)
+    if entry_id not in ids:
+        ids.append(entry_id)
+        state.put(STATE_INDEX_KEY, orjson.dumps(ids).decode("utf-8"))
+
+
+def _index_remove(state: BroadcastState, entry_id: str) -> None:
+    ids = _read_state_index(state)
+    if entry_id in ids:
+        ids.remove(entry_id)
+        state.put(STATE_INDEX_KEY, orjson.dumps(ids).decode("utf-8"))
 
 
 class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
@@ -227,7 +308,7 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
 
     Multi-tenancy support:
     - Filters rules by job_id
-    - Supports output_mode (all_events / matched_only)
+    - Supports per-destination output_mode (all_events / matched_only / unmatched_only)
 
     Metrics:
     - Flink counters available via REST API (total_events, matched_events)
@@ -239,19 +320,28 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         window_size_seconds: int,
         window_count_threshold: int,
         job_id: str,
-        output_mode: str,
+        destinations: list[OutputDestination],
         keep_filtered_events: bool = False,
-        apply_parser_to_output_events: bool = False,
+        emit_tagged_events: bool = True,
     ):
+        if not destinations:
+            raise ValueError("destinations must contain at least one OutputDestination")
+        if len(destinations) > MAX_OUTPUT_DESTINATIONS:
+            raise ValueError(
+                f"destinations supports at most {MAX_OUTPUT_DESTINATIONS} "
+                f"entries (got {len(destinations)})"
+            )
+
         self.window_size_ms = window_size_seconds * 1000
         self.window_size_seconds = window_size_seconds
         self.window_count_threshold = window_count_threshold
 
         # Multi-tenancy parameters
         self.job_id = job_id
-        self.output_mode = output_mode  # "all_events" or "matched_only"
+        self.destinations = list(destinations)
+        self._has_severity_filter = any(d.severities for d in self.destinations)
         self.keep_filtered_events = keep_filtered_events
-        self.apply_parser_to_output_events = apply_parser_to_output_events
+        self.emit_tagged_events = emit_tagged_events
 
         # Operator-local caches (per subtask, shared across keys)
         # Rebuilt on first window after restart - fast enough
@@ -278,17 +368,22 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         # Cumulative counters (for Kafka metrics consumer)
         self._matched_events_count = [0]
         self._total_events_count = [0]
-        # Per-key rate gauges aggregated at instance level (sum across all keys)
-        # Updated at end of each window; gauge returns sum of all keys on this subtask
-        self._input_eps_per_key: dict[str, float] = {}
-        self._output_tagged_eps_per_key: dict[str, float] = {}
-        self._output_untagged_eps_per_key: dict[str, float] = {}
+        # Per-key rate gauges aggregated at instance level (sum across all keys).
+        # Updated at end of each window; gauge returns sum of all keys on this subtask.
+        # Integer EPS: thread (Pemja) mode drops float gauge callables from the Flink REST
+        # catalog, so the dashboard poller sees input_eps=0. Process mode accepts floats,
+        # but int keeps both modes working (dashboard loses sub-EPS decimals).
+        self._input_eps_per_key: dict[str, int] = {}
+        self._output_tagged_eps_per_key: dict[str, int] = {}
+        self._output_untagged_eps_per_key: dict[str, int] = {}
         # Error/processing counters (internal use only)
         self._event_parsing_errors_counter = None
         self._schema_parsing_errors_counter = None
         self._rule_parsing_errors_counter = None
         self._matching_errors_counter = None
         self._windows_processed_counter = None
+        self._windows_skipped_counter = None
+        self._events_discarded_counter = None
         # Distributions (for timing stats)
         self._window_duration_distribution = None
         self._matching_duration_distribution = None
@@ -296,6 +391,8 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         self._active_rules_count = [0]
         # Init metric (job_id, instance_id, timestamp, version) sent once per instance
         self._init_metric_sent = False
+        # Warn once per subtask when tagged events cannot be correlated downstream
+        self._tagged_config_warned = False
         self._prefiltered_events_count = [0]
         # Per-key last window timestamp; gauge returns max (most recent) across keys
         self._last_window_ts_per_key: dict[str, int] = {}
@@ -336,22 +433,22 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         metrics_group.gauge("matchedEvents", lambda: self._matched_events_count[0])
         metrics_group.gauge("totalEvents", lambda: self._total_events_count[0])
 
-        # Per-key rate gauges: each on_timer writes its key's rate, gauge sums across all keys
-        # This correctly aggregates when multiple keys are assigned to one subtask
+        # Per-key rate gauges: each on_timer writes its key's rate, gauge sums across all keys.
+        # Must return int in thread mode — see _input_eps_per_key comment above.
         self._input_eps_per_key = {}
         self._output_tagged_eps_per_key = {}
         self._output_untagged_eps_per_key = {}
         metrics_group.gauge(
             "inputEventsPerSecond",
-            lambda: round(sum(self._input_eps_per_key.values()), 2),
+            lambda: sum(self._input_eps_per_key.values()),
         )
         metrics_group.gauge(
             "outputTaggedPerSecond",
-            lambda: round(sum(self._output_tagged_eps_per_key.values()), 2),
+            lambda: sum(self._output_tagged_eps_per_key.values()),
         )
         metrics_group.gauge(
             "outputUntaggedPerSecond",
-            lambda: round(sum(self._output_untagged_eps_per_key.values()), 2),
+            lambda: sum(self._output_untagged_eps_per_key.values()),
         )
 
         # Prefiltered events counter (cumulative, like matchedEvents/totalEvents)
@@ -378,6 +475,11 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
 
         # Processing counters
         self._windows_processed_counter = metrics_group.counter("windowsProcessed")
+        # Windows thrown away before matching, and the events lost with them. Without these a
+        # discarded window is indistinguishable from a source that stopped reading: the events
+        # are consumed and committed, but nothing downstream ever accounts for them.
+        self._windows_skipped_counter = metrics_group.counter("windowsSkipped")
+        self._events_discarded_counter = metrics_group.counter("eventsDiscarded")
 
         # Gauges (callable that returns current value)
         metrics_group.gauge("activeRulesCount", lambda: self._active_rules_count[0])
@@ -399,7 +501,15 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             job_id=self.job_id,
             window_size_seconds=self.window_size_seconds,
             window_count_threshold=self.window_count_threshold,
-            output_mode=self.output_mode,
+            destinations=[
+                {
+                    "topic": d.topic,
+                    "output_mode": d.output_mode,
+                    "apply_parser_to_output_events": d.apply_parser_to_output_events,
+                    "severities": sorted(d.severities),
+                }
+                for d in self.destinations
+            ],
             keep_filtered_events=self.keep_filtered_events,
             rules_source="broadcast_stream",
             pid=os.getpid(),
@@ -411,7 +521,7 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
                 "prefilteredEvents",  # Cumulative (events excluded by prefilters)
                 "inputEventsPerSecond",  # Dashboard: input EPS (source of truth)
                 "outputTaggedPerSecond",  # Dashboard: tagged events/sec to output
-                "outputUntaggedPerSecond",  # Dashboard: untagged events/sec (0 if matched_only)
+                "outputUntaggedPerSecond",  # Dashboard: untagged events/sec (0 if every dest is matched_only)
                 "lastWindowTimestampMs",  # Unix epoch ms when last window was processed
                 "eventParsingErrors",
                 "ruleParsingErrors",
@@ -423,10 +533,13 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
                 "matchingDurationMs",
                 "enrichmentEmitDurationMs",
                 "windowsProcessed",
+                "windowsSkipped",
+                "eventsDiscarded",
                 "activeRulesCount",
                 "windowDurationMs",
             ],
         )
+        logger.info("tagged events emit configured", enabled=self.emit_tagged_events)
 
     def process_element(self, value: str, ctx):  # noqa: ANN001
         """
@@ -540,6 +653,44 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             )
             return None
 
+    def _build_window_discarded_metric_json(
+        self, reason: str, discarded_events: int, current_key: object
+    ) -> str | None:
+        """Account for a window dropped before it could be matched.
+
+        Dropping is intentional — there is nothing to match the buffer against — but doing it
+        silently is what made a startup race look like a stalled Kafka source: the events are
+        consumed, their offsets committed, and then they vanish with no metric to show for them.
+
+        Deliberately carries no ``window_total_events``: these events were never processed, and
+        anything summing window totals must not count them as if they had been. Consumers that
+        do not know this shape ignore the extra fields and see a zero-event report, exactly as
+        they already do for the init metric.
+        """
+        self._windows_skipped_counter.inc()
+        self._events_discarded_counter.inc(discarded_events)
+        logger.warning(
+            "window discarded",
+            reason=reason,
+            discarded_events=discarded_events,
+            key=str(current_key),
+        )
+        try:
+            return orjson.dumps(
+                {
+                    "job_id": self.job_id,
+                    "instance_id": self._instance_id,
+                    "key": str(current_key),
+                    "timestamp": int(time.time() * 1000),
+                    "detectflow_matchnode_version": get_version(),
+                    "window_discarded_reason": reason,
+                    "window_discarded_events": discarded_events,
+                }
+            ).decode("utf-8")
+        except Exception as e:
+            logger.warning("window discarded metric emit failed", error=str(e), reason=reason)
+            return None
+
     def _check_if_event_is_relevant_for_job(self, event: dict) -> bool:
         return event.get("job_id") == self.job_id
 
@@ -584,12 +735,14 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             return
 
         if event.get("deleted") is True:
-            if state.contains(filter_id):
+            if state.get(filter_id) is not None:
                 state.remove(filter_id)
+                _index_remove(state, filter_id)
                 logger.info("filter deleted", filter_id=filter_id)
         else:
             filter_json = orjson.dumps(event).decode("utf-8")
             state.put(filter_id, filter_json)
+            _index_add(state, filter_id)
             logger.info("filter updated", filter_id=filter_id)
 
     def _process_rule_event(self, event: dict, state: BroadcastState) -> None:
@@ -602,8 +755,9 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         # Delete only when sigma.text is empty (logical delete)
         empty_sigma = not event.get("sigma", {}).get("text")
         if empty_sigma:
-            if state.contains(rule_id):
+            if state.get(rule_id) is not None:
                 state.remove(rule_id)
+                _index_remove(state, rule_id)
                 # Invalidate rules cache - rules changed
                 self._rules_state_changed = True
                 logger.info("rule deleted", rule_id=rule_id, job_id=self.job_id)
@@ -611,6 +765,7 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
 
         rule_json = orjson.dumps(event).decode("utf-8")
         state.put(rule_id, rule_json)
+        _index_add(state, rule_id)
         # Invalidate rules cache - rules changed
         self._rules_state_changed = True
         logger.info(
@@ -641,7 +796,7 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
     @staticmethod
     def _get_filters_from_state(state: BroadcastState) -> list[Filter]:
         filters = []
-        for filter_id in state.keys():
+        for filter_id in _read_state_index(state):
             filter_json = state.get(filter_id)
             if filter_json:
                 f = convert_filter_kafka_event_to_filter(orjson.loads(filter_json))
@@ -700,12 +855,15 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
 
     @staticmethod
     def _read_rules_from_broadcast(rules_state: BroadcastState) -> tuple[list[dict], str]:
-        """Read all rules from broadcast state and compute content signature."""
+        """Read all rules from broadcast state and compute content signature.
+
+        Uses the incrementally-maintained id index instead of iterating the
+        state — Pemja (thread mode) exposes no iteration on the Java proxy.
+        """
         rules_data = []
         hasher = hashlib.sha1()
 
-        rule_ids = list(rules_state.keys())
-        for rule_id in sorted(rule_ids):
+        for rule_id in sorted(_read_state_index(rules_state)):
             rule_json = rules_state.get(rule_id)
             if rule_json:
                 hasher.update(rule_id.encode("utf-8"))
@@ -800,48 +958,253 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             logger.exception("sigma matching error", error=str(e))
             return None
 
-    def _enrich_and_emit_events(
-        self,
-        event_buffer: list[dict],
-        case_ids_per_event: list[list[str]],
-        sigmas: list[Sigma],
-        custom_fields: dict | None,
-        metrics: WindowMetrics,
-        prefiltered_mask: list[bool] | None = None,
-    ):
-        """
-        Enrich matched events and yield to output.
-
-        Updates metrics in place:
-        - metrics.matched_events, metrics.matched_rules
-        - metrics.output_tagged, metrics.output_untagged (events ACTUALLY written to output)
-
-        Yields enriched events as JSON strings.
-        """
-        enrichment_map = {
+    @staticmethod
+    def _build_enrichment_map(sigmas: list[Sigma]) -> dict[str, dict]:
+        return {
             e.case_id: {
                 "rule_id": e.case_id,
                 "rule_title": e.title,
                 "severity": e.level,
+                "sigma_uuid": e.sigma_uuid,
                 "technique_ids": e.technique_ids,
                 "techniques": e.techniques,
+                "updated": e.updated,
             }
             for e in sigmas
         }
-        for idx, (event, case_ids) in enumerate(
-            zip(event_buffer, case_ids_per_event, strict=False)
+
+    @staticmethod
+    def _detection_to_match(detection: dict) -> dict:
+        """Map an internal enrichment dict to a ``detectflow.matches[]`` entry.
+
+        Both ids are carried explicitly: ``sigma_rule_uuid`` (the Sigma rule
+        UUID, used by downstream correlation as the inverted-index key) and
+        ``_rule_id`` (the internal case id). This removes the old ambiguity
+        where a single ``sigma_rule_ids`` field meant different ids in the
+        output vs the tagged-events topic.
+        """
+        return {
+            "sigma_rule_uuid": detection.get("sigma_uuid"),
+            "_rule_id": detection.get("rule_id"),
+            "rule_name": detection.get("rule_title"),
+            "severity": detection.get("severity"),
+            "mitre_techniques": detection.get("technique_ids", []) or [],
+        }
+
+    @staticmethod
+    def _primary_detection_sort_key(detection: dict) -> tuple[int, datetime]:
+        """Sort key for primary_match: highest severity, then latest ``updated``."""
+        severity = (detection.get("severity") or "").lower()
+        rank = _SEVERITY_RANK.get(severity, -1)
+        updated = _parse_timestamp_to_utc_datetime(detection.get("updated"))
+        return (rank, updated if updated is not None else _MISSING_UPDATED)
+
+    @staticmethod
+    def _select_primary_detection(detections: list[dict]) -> dict | None:
+        """Pick the rule that becomes ``detectflow.primary_match``.
+
+        Highest Sigma severity wins. Equal severity is broken by the later
+        Kafka ``updated`` timestamp. Equal keys keep the first detection
+        (``max`` is stable).
+        """
+        if not detections:
+            return None
+        return max(detections, key=SigmaMatcherBroadcastFunction._primary_detection_sort_key)
+
+    @staticmethod
+    def _build_detectflow(
+        detections: list[dict],
+        processed_at: str,
+        matchnode_version: str,
+    ) -> dict:
+        """Build the ``detectflow`` block shared by detections and tagged-events."""
+        matches = [SigmaMatcherBroadcastFunction._detection_to_match(d) for d in detections]
+        detectflow: dict = {
+            "processed_at": processed_at,
+            "matchnode_version": matchnode_version,
+        }
+        primary = SigmaMatcherBroadcastFunction._select_primary_detection(detections)
+        if primary is not None:
+            primary_match = SigmaMatcherBroadcastFunction._detection_to_match(primary)
+            detectflow["severity"] = primary_match["severity"]
+            detectflow["primary_match"] = primary_match
+        detectflow["matches"] = matches
+        return detectflow
+
+    def _create_tagged_event_json(
+        self,
+        parsed_event: dict,
+        logsource_config: LogsourceConfig,
+        detectflow: dict,
+    ) -> str | None:
+        """Build one ``detectflow.tagged-events`` envelope for a matched event.
+
+        Emitted ONCE per matched event regardless of how many destinations the pipeline
+        fans out to — the destination sinks are a separate side-output path.
+
+        Isolation for correlation is ``pipeline_id`` (this job's ``JOB_ID``) plus the
+        dedicated tagged-events topic. Destination topic names are SIEM output only and
+        are not stamped on this envelope.
+        """
+        tagged_event = {
+            "pipeline_id": self.job_id,
+            "timestamp": extract_timestamp_from_sigma_event(
+                parsed_event,
+                logsource_config.timestamp_fields,
+            ),
+            "hostname": extract_hostname_from_sigma_event(
+                parsed_event,
+                logsource_config.hostname_fields,
+            ),
+            "detectflow": detectflow,
+            "parsed_event": parsed_event,
+        }
+
+        try:
+            return orjson.dumps(tagged_event).decode("utf-8")
+        except Exception as e:
+            logger.error("tagged event serialization failed", error=str(e))
+            return None
+
+    def _build_detectflow_block(
+        self,
+        case_ids: list[str],
+        enrichment_map: dict[str, dict],
+        processed_at: str,
+        matchnode_version: str,
+    ) -> dict | None:
+        """Build the shared ``detectflow`` enrichment block for a matched event."""
+        if not case_ids:
+            return None
+        detections = [enrichment_map[cid] for cid in case_ids if enrichment_map.get(cid)]
+        return self._build_detectflow(
+            detections=detections,
+            processed_at=processed_at,
+            matchnode_version=matchnode_version,
+        )
+
+    def _serialize_destination_payload(
+        self,
+        *,
+        base_event: dict,
+        custom_fields: dict | None,
+        detectflow: dict | None,
+        event_idx: int,
+        destination_topic: str,
+    ) -> str | None:
+        """Build one destination JSON string (shallow copy + optional enrichment)."""
+        event = dict(base_event)
+        if custom_fields:
+            event.update(custom_fields)
+        if detectflow is not None:
+            event["detectflow"] = detectflow
+        try:
+            return orjson.dumps(event).decode("utf-8")
+        except Exception as e:
+            logger.error(
+                "event serialization failed",
+                error=str(e),
+                destination_topic=destination_topic,
+                event_idx=event_idx,
+            )
+            return None
+
+    def _iter_destination_emits(
+        self,
+        *,
+        event_idx: int,
+        case_ids: list[str],
+        original_event: dict,
+        parsed_event: dict,
+        custom_fields: dict | None,
+        detectflow: dict | None,
+        event_levels: frozenset[str] = frozenset(),
+    ):
+        """Yield ``(DETECTIONS_OUTPUT_TAG, Row(topic, json))`` for each accepting dest.
+
+        Applies per-destination ``output_mode``, ``severities`` (matched_only only — set
+        nowhere else; a detection passes when any of its rules' levels, ``event_levels``,
+        is selected) and ``apply_parser_to_output_events``.
+        Payload shape depends only on the parser flag (+ shared enrichment), so JSON is
+        memoized per flag — N destinations with the same flag serialize once, not N times.
+        The Kafka sink routes on ``Row[0]`` (topic); ``Row[1]`` is the event JSON.
+        """
+        matched = bool(case_ids)
+        # At most two distinct bodies per event: parsed vs raw.
+        serialized_by_parser_flag: dict[bool, str | None] = {}
+        for dest in self.destinations:
+            if not destination_accepts(dest.output_mode, matched):
+                continue
+            if matched and dest.severities and dest.severities.isdisjoint(event_levels):
+                continue
+
+            use_parsed = dest.apply_parser_to_output_events
+            if use_parsed not in serialized_by_parser_flag:
+                base_event = parsed_event if use_parsed else original_event
+                serialized_by_parser_flag[use_parsed] = self._serialize_destination_payload(
+                    base_event=base_event,
+                    custom_fields=custom_fields,
+                    detectflow=detectflow,
+                    event_idx=event_idx,
+                    destination_topic=dest.topic,
+                )
+
+            payload = serialized_by_parser_flag[use_parsed]
+            if payload is not None:
+                yield DETECTIONS_OUTPUT_TAG, Row(dest.topic, payload)
+
+    def _enrich_and_emit_events(
+        self,
+        original_event_buffer: list[dict],
+        match_result: SigmaMatchingResult,
+        sigmas: list[Sigma],
+        custom_fields: dict | None,
+        logsource_config: LogsourceConfig,
+        metrics: WindowMetrics,
+    ):
+        """
+        Enrich events and fan out to per-destination side outputs + tagged-events.
+
+        Updates metrics in place:
+        - metrics.matched_events, metrics.matched_rules
+        - metrics.output_tagged, metrics.output_untagged (events written to ANY
+          destination — not multiplied by fan-out)
+
+        Yields ``(OutputTag, value)``: ``ROW<topic, json>`` on the detections tag,
+        JSON strings on tagged-events.
+        """
+        enrichment_map = self._build_enrichment_map(sigmas)
+        # Processing-time metadata stamped on the detectflow block, shared by
+        # every event emitted from this window (output destinations + tagged-events).
+        processed_at = _format_rfc3339_utc(datetime.now(timezone.utc))
+        matchnode_version = get_version()
+
+        # Tagged events without a hostname or a timestamp are dropped by correlation
+        # (missing_hostname / bad_timestamp), while this node's own metrics stay green.
+        # Both come from the pipeline's parser broadcast config, so warn once per subtask.
+        if (
+            self.emit_tagged_events
+            and not self._tagged_config_warned
+            and not (logsource_config.hostname_fields and logsource_config.timestamp_fields)
         ):
-            is_prefiltered = bool(prefiltered_mask and prefiltered_mask[idx])
+            self._tagged_config_warned = True
+            logger.warning(
+                "tagged events will be dropped downstream",
+                reason="logsource parser config is missing hostname_fields or timestamp_fields",
+                hostname_fields=logsource_config.hostname_fields,
+                timestamp_fields=logsource_config.timestamp_fields,
+                job_id=self.job_id,
+            )
 
-            if custom_fields:
-                event.update(custom_fields)
+        for idx, case_ids in enumerate(match_result.case_ids_per_event):
+            is_prefiltered = bool(
+                match_result.prefiltered_mask and match_result.prefiltered_mask[idx]
+            )
 
-            # Track matched rules
+            # Match counters update BEFORE output filtering (gauges / Kafka metrics).
             if case_ids:
                 for case_id in case_ids:
                     metrics.matched_rules[case_id] = metrics.matched_rules.get(case_id, 0) + 1
-
-            # Update Flink metrics BEFORE output filtering (gauges exposed via REST API)
             self._total_events_count[0] += 1
             if case_ids:
                 metrics.matched_events += 1
@@ -853,30 +1216,51 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
                 if not self.keep_filtered_events:
                     continue
 
-            # Output mode filtering (AFTER counter update)
-            # If matched_only, untagged events are NOT written to output topic
-            if self.output_mode == "matched_only" and not case_ids:
-                continue
+            # Shared enrichment for tagged-events + every destination that receives
+            # this event. Unmatched events carry no detectflow block.
+            detectflow = self._build_detectflow_block(
+                case_ids, enrichment_map, processed_at, matchnode_version
+            )
+            # Skip building the tagged-event JSON when nothing consumes it:
+            # this, not the sink, is where the per-event CPU goes.
+            if detectflow is not None and self.emit_tagged_events:
+                tagged_event_json = self._create_tagged_event_json(
+                    parsed_event=match_result.parsed_events[idx],
+                    logsource_config=logsource_config,
+                    detectflow=detectflow,
+                )
+                if tagged_event_json is not None:
+                    yield TAGGED_EVENTS_OUTPUT_TAG, tagged_event_json
 
-            # Add detection info
-            if case_ids:
-                event["sigma_rule_ids"] = case_ids
-                event["sigma_detections"] = [
-                    enrichment_map.get(cid) for cid in case_ids if enrichment_map.get(cid)
-                ]
-            else:
-                event["sigma_rule_ids"] = []
-                event["sigma_detections"] = []
+            event_levels = (
+                frozenset(
+                    _canonical_level(enrichment_map[cid]["severity"])
+                    for cid in case_ids
+                    if cid in enrichment_map
+                )
+                if case_ids and self._has_severity_filter
+                else frozenset()
+            )
 
-            try:
-                yield orjson.dumps(event).decode("utf-8")
-                # Count events ACTUALLY written to output topic
+            emitted_to_any_destination = False
+            for item in self._iter_destination_emits(
+                event_idx=idx,
+                case_ids=case_ids,
+                original_event=original_event_buffer[idx],
+                parsed_event=match_result.parsed_events[idx],
+                custom_fields=custom_fields,
+                detectflow=detectflow,
+                event_levels=event_levels,
+            ):
+                emitted_to_any_destination = True
+                yield item
+
+            # Count once per event if written to any destination (not × N destinations)
+            if emitted_to_any_destination:
                 if case_ids:
                     metrics.output_tagged += 1
                 else:
                     metrics.output_untagged += 1
-            except Exception as e:
-                logger.error("event serialization failed", error=str(e))
 
     def _update_flink_metrics(self, metrics: WindowMetrics) -> None:
         """Update Flink distribution metrics (visible via REST API)."""
@@ -974,12 +1358,20 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         )
         sigmas = self._load_and_parse_rules(ctx, metrics)
 
-        if not sigmas and self.output_mode == "matched_only":
-            logger.warning(
-                "window skipped",
-                reason="no_rules_matched_only_mode",
-                buffered_events=len(event_buffer),
+        # With no rules nothing can match, so the window is only skippable when NO
+        # destination wants unmatched traffic (all_events / unmatched_only would still
+        # have to emit every buffered event).
+        wants_unmatched = any(
+            destination_accepts(d.output_mode, matched=False) for d in self.destinations
+        )
+        if not sigmas and not wants_unmatched:
+            # Normally a startup race: the events source begins draining its backlog before the
+            # rules broadcast has finished loading, so the first windows have nothing to match.
+            metric_json = self._build_window_discarded_metric_json(
+                "no_rules_matched_only_mode", len(event_buffer), current_key
             )
+            if metric_json:
+                yield METRICS_OUTPUT_TAG, metric_json
             self._clear_window_state()
             return
 
@@ -995,6 +1387,14 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
 
         if match_result is None:
             metrics.errors.matching += 1
+            # This path returns before _update_flink_metrics, so the error counter has to be
+            # advanced here or the failure never shows up anywhere.
+            self._matching_errors_counter.inc(1)
+            metric_json = self._build_window_discarded_metric_json(
+                "matching_failed", len(event_buffer), current_key
+            )
+            if metric_json:
+                yield METRICS_OUTPUT_TAG, metric_json
             self._clear_window_state()
             return
 
@@ -1005,14 +1405,12 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         # ========== Enrich and emit ==========
         metrics.timings.enrichment_emit.start = time.time()
         yield from self._enrich_and_emit_events(
-            event_buffer=match_result.parsed_events
-            if self.apply_parser_to_output_events
-            else event_buffer,
-            case_ids_per_event=match_result.case_ids_per_event,
+            original_event_buffer=event_buffer,
+            match_result=match_result,
             sigmas=sigmas,
             custom_fields=custom_fields,
+            logsource_config=logsource_config,
             metrics=metrics,
-            prefiltered_mask=match_result.prefiltered_mask,
         )
         metrics.timings.enrichment_emit.end = time.time()
 
@@ -1023,19 +1421,22 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
             window_start_ms / 1000.0 if window_start_ms else metrics.timings.on_timer_start
         )
 
-        # Update per-key EPS gauges (instance-level gauge = sum across all keys)
+        # Update per-key EPS gauges (instance-level gauge = sum across all keys).
+        # Integer EPS for thread-mode REST visibility — see open() gauge registration.
         key = str(current_key)
         window_duration = metrics.timings.window_duration
         if window_duration > 0:
-            self._input_eps_per_key[key] = round(metrics.total_events / window_duration, 2)
-            self._output_tagged_eps_per_key[key] = round(metrics.output_tagged / window_duration, 2)
-            self._output_untagged_eps_per_key[key] = round(
-                metrics.output_untagged / window_duration, 2
+            self._input_eps_per_key[key] = int(round(metrics.total_events / window_duration))
+            self._output_tagged_eps_per_key[key] = int(
+                round(metrics.output_tagged / window_duration)
+            )
+            self._output_untagged_eps_per_key[key] = int(
+                round(metrics.output_untagged / window_duration)
             )
         else:
-            self._input_eps_per_key[key] = 0.0
-            self._output_tagged_eps_per_key[key] = 0.0
-            self._output_untagged_eps_per_key[key] = 0.0
+            self._input_eps_per_key[key] = 0
+            self._output_tagged_eps_per_key[key] = 0
+            self._output_untagged_eps_per_key[key] = 0
         # Update per-key last window timestamp (instance-level gauge = max across keys)
         self._last_window_ts_per_key[key] = int(time.time() * 1000)
 
@@ -1068,16 +1469,16 @@ class SigmaMatcherBroadcastFunction(KeyedBroadcastProcessFunction):
         flushed_by_early_flush: bool,
     ) -> str | None:
         """
-        Create per-rule metrics message for Kafka (consumed by admin-panel-backend).
+        Create per-rule metrics message for Kafka (consumed by detectflow-backend).
 
-        The admin-panel-backend uses this to populate pipeline_rule_metrics table
+        The detectflow-backend uses this to populate pipeline_rule_metrics table
         which tracks per-rule match counts. Only essential fields are included.
 
         Args:
             metrics: WindowMetrics containing match data
 
         Returns:
-            JSON metric string for admin-panel-backend, or None on error
+            JSON metric string for detectflow-backend, or None on error
         """
         sorted_rules = sorted(metrics.matched_rules.items(), key=lambda x: x[1], reverse=True)
         window_start_timestamp = (

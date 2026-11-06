@@ -7,8 +7,16 @@ logger = get_logger(__name__)
 
 
 class LogsourceConfig:
-    def __init__(self, parser_config: dict | None = None, field_mapping_str: str | None = None):
+    def __init__(
+        self,
+        parser_config: dict | None = None,
+        field_mapping_str: str | None = None,
+        hostname_fields: list[str] | None = None,
+        timestamp_fields: list[str] | None = None,
+    ):
         self.parser_config = parser_config
+        self.hostname_fields = self._normalize_field_paths(hostname_fields, "hostname_fields")
+        self.timestamp_fields = self._normalize_field_paths(timestamp_fields, "timestamp_fields")
         try:
             self.field_mapping = self._get_field_mapping_from_str(field_mapping_str)
         except Exception as e:
@@ -16,7 +24,34 @@ class LogsourceConfig:
             self.field_mapping = FieldMapping({})
 
     def __repr__(self) -> str:
-        return f"LogsourceConfig(parser_config={self.parser_config}, field_mapping={self.field_mapping})"
+        return (
+            "LogsourceConfig("
+            f"parser_config={self.parser_config}, "
+            f"field_mapping={self.field_mapping}, "
+            f"hostname_fields={self.hostname_fields}, "
+            f"timestamp_fields={self.timestamp_fields}"
+            ")"
+        )
+
+    @staticmethod
+    def _normalize_field_paths(field_paths: list[str] | None, config_name: str) -> list[str]:
+        if not field_paths:
+            return []
+
+        if not isinstance(field_paths, list):
+            logger.error(
+                "invalid field path config, falling back to empty list", config_name=config_name
+            )
+            return []
+
+        normalized_fields = []
+        for field in field_paths:
+            if isinstance(field, str) and field.strip():
+                normalized_fields.append(field.strip())
+            else:
+                logger.error("invalid field path, skipping", config_name=config_name, field=field)
+
+        return normalized_fields
 
     @staticmethod
     def _get_field_mapping_from_str(field_mapping_str: str | None) -> FieldMapping:
@@ -91,4 +126,6 @@ def convert_kafka_event_to_logsource_config(
 
     parser_config = event.get("parser", {}).get("config")
     mapping = event.get("mapping")
-    return LogsourceConfig(parser_config, mapping)
+    hostname_fields = event.get("hostname_fields")
+    timestamp_fields = event.get("timestamp_fields")
+    return LogsourceConfig(parser_config, mapping, hostname_fields, timestamp_fields)

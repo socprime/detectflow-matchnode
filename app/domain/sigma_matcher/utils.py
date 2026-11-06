@@ -1,13 +1,125 @@
 import re
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Literal
 
+from dateutil import parser as dateutil_parser
 from pydantic import BaseModel
+
+UTC = timezone.utc
 
 
 class ConditionIsNotValid(Exception):  # noqa: N818
     pass
+
+
+def _get_value_by_path(event: dict, path: str):
+    """Return value by dotted path or literal key."""
+    if path in event:
+        return event[path]
+
+    current = event
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+def _get_by_path(event: dict, path: str) -> str | None:
+    """Return string value by dotted path or literal key."""
+    value = _get_value_by_path(event, path)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def extract_hostname_from_sigma_event(event: dict, hostname_fields: list[str] | None) -> str | None:
+    """
+    Extract hostname using field paths configured by the logsource Kafka event.
+    """
+    if not hostname_fields:
+        return None
+
+    for candidate_path in hostname_fields:
+        value = _get_by_path(event, candidate_path)
+        if value:
+            return value
+
+    return None
+
+
+def _format_rfc3339_utc(dt: datetime) -> str:
+    """
+    Format as RFC3339 in UTC (e.g. 2026-05-08T13:00:00.000Z).
+    """
+    dt_utc = dt.astimezone(UTC)
+    text = dt_utc.isoformat(timespec="milliseconds")
+    if text.endswith("+00:00"):
+        return text[:-6] + "Z"
+    return text
+
+
+def _numeric_epoch_to_utc(seconds: float) -> datetime | None:
+    """UNIX epoch: scale ms/us heuristically, convert to timezone-aware UTC."""
+    if seconds > 1e15:
+        seconds /= 1_000_000.0
+    elif seconds > 1e12:
+        seconds /= 1000.0
+    try:
+        return datetime.fromtimestamp(seconds, tz=UTC)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _parse_timestamp_to_utc_datetime(value) -> datetime | None:
+    """TODO(temp): Replace with configurable timestamp parsing. Best-effort UTC parse."""
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return _numeric_epoch_to_utc(float(value))
+
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            dt = dateutil_parser.parse(s)
+        except (ValueError, TypeError, OverflowError):
+            try:
+                return _numeric_epoch_to_utc(float(s))
+            except ValueError:
+                return None
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+
+    return None
+
+
+def extract_timestamp_from_sigma_event(
+    event: dict, timestamp_fields: list[str] | None
+) -> str | None:
+    """
+    Extract timestamp using field paths configured by the logsource Kafka event.
+
+    String timestamps use python-dateutil; numeric values use UNIX epoch heuristics.
+
+    Returns RFC3339 string in UTC, or None if nothing parseable is found.
+    """
+    if not timestamp_fields:
+        return None
+
+    for candidate_path in timestamp_fields:
+        raw = _get_value_by_path(event, candidate_path)
+        dt = _parse_timestamp_to_utc_datetime(raw)
+        if dt is not None:
+            return _format_rfc3339_utc(dt)
+
+    return None
 
 
 def timer_wrapper(func: Callable) -> Callable:

@@ -75,8 +75,11 @@ COPY --chown=flink:flink log4j2.properties /opt/flink/pyflink/log4j2.properties
 RUN mkdir -p /opt/flink/checkpoints /opt/flink/log && \
     chown -R flink:flink /opt/flink/checkpoints /opt/flink/log /opt/flink/pyflink
 
+# polars[rtcompat] installs both builds, and Polars prefers compat when unset.
+# Keep the AVX2 build unless a deployment overrides this (old CPUs: compat).
 ENV PYTHONPATH="/opt/flink/pyflink:$PYTHONPATH" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    POLARS_FORCE_PKG=32
 
 USER flink
 WORKDIR /opt/flink

@@ -133,6 +133,8 @@ class TestConvertKafkaEventToLogsourceConfig:
         config = convert_kafka_event_to_logsource_config({})
         assert config.parser_config is None
         assert config.field_mapping.field_mapping == {}
+        assert config.hostname_fields == []
+        assert config.timestamp_fields == []
 
     def test_event_with_mapping(self):
         """Event with mapping string is parsed into field_mapping."""
@@ -152,9 +154,16 @@ class TestConvertKafkaEventToLogsourceConfig:
         """Both parser config and valid mapping are preserved."""
         parser_cfg = {"type": "syslog", "pattern": ".*"}
         mapping = "EventID: winlog.event_id\nSourceName:\n  - source\n  - provider"
-        event = {"parser": {"config": parser_cfg}, "mapping": mapping}
+        event = {
+            "parser": {"config": parser_cfg},
+            "mapping": mapping,
+            "hostname_fields": ["host.name", "winlog.computer_name"],
+            "timestamp_fields": ["@timestamp", "winlog.time_created"],
+        }
         config = convert_kafka_event_to_logsource_config(event)
         assert config.parser_config == parser_cfg
+        assert config.hostname_fields == ["host.name", "winlog.computer_name"]
+        assert config.timestamp_fields == ["@timestamp", "winlog.time_created"]
         assert config.field_mapping.field_mapping == {
             "EventID": ["winlog.event_id"],
             "SourceName": ["source", "provider"],

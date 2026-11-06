@@ -30,6 +30,7 @@ class CaseDict(BaseModel, extra="ignore"):
 class SigmaDict(BaseModel, extra="ignore"):
     text: str
     level: str | None = None
+    sigma_uuid: str | None = None
 
 
 class TechniqueDict(BaseModel, extra="ignore"):
@@ -45,6 +46,8 @@ class RuleData(BaseModel, extra="ignore"):
     case: CaseDict
     sigma: SigmaDict
     tags: Any | None = None
+    created: str | None = None
+    updated: str | None = None
 
 
 def _parse_rule_data(rule_dict: dict) -> RuleData | None:
@@ -111,6 +114,9 @@ def load_sigmas_from_rules_data(rules_data: list[dict]) -> list[Sigma]:
                 title=rule.case.name,
                 level=rule.sigma.level,
                 techniques=_parse_techniques(d),
+                sigma_uuid=rule.sigma.sigma_uuid,
+                created=rule.created,
+                updated=rule.updated,
             )
 
             sigmas.append(sigma)
