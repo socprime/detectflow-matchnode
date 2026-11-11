@@ -1,5 +1,5 @@
 # Prime Detect Match Node
-[![Version](https://img.shields.io/badge/version-2.3.2-blue.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-2.3.3-blue.svg)](pyproject.toml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![Apache Flink 2.2](https://img.shields.io/badge/Flink-2.2-green.svg)](https://flink.apache.org/)
 
