@@ -45,12 +45,14 @@ RUN uv python install 3.11 && \
 
 # Copy project files
 COPY pyproject.toml uv.lock ./
-COPY app ./app
 
-# Install with [confluent] extra (cp-pyflink instead of apache-flink)
+# Install locked versions from uv.lock
 RUN --mount=type=cache,target=/root/.cache/uv \
-    . .venv/bin/activate && \
-    uv pip install --no-cache ".[confluent]"
+    uv sync --frozen --no-dev --extra confluent --no-install-project
+
+COPY app ./app
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --extra confluent --no-editable
 
 # Verify installation
 RUN . .venv/bin/activate && \

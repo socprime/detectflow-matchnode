@@ -21,7 +21,7 @@ RUN set -ex; apt-get update && apt-get install -y --no-install-recommends \
 RUN set -ex; \
     ln -sf /usr/bin/python3 /usr/bin/python && \
     ln -sf /usr/bin/pip3 /usr/bin/pip && \
-    pip install --no-cache-dir --break-system-packages --upgrade "setuptools>=82.0.0" && \
+    pip install --no-cache-dir --break-system-packages "setuptools==84.2.1" && \
     rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
 
 ################################################################################
@@ -43,12 +43,15 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.24 /uv /uvx /bin/
 WORKDIR /opt/flink/usrlib
 COPY pyproject.toml uv.lock ./
 
-# Copy application code (needed for package install)
-COPY app /opt/flink/usrlib/app
-
-# Install with [kubernetes] extra (apache-flink)
+# Install locked versions from uv.lock into the system Python
+# (--inexact: keep apt-installed packages that are not in the lock)
+ENV UV_PROJECT_ENVIRONMENT=/usr
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --no-cache ".[kubernetes]"
+    uv sync --frozen --inexact --no-dev --extra kubernetes --no-install-project
+
+COPY app /opt/flink/usrlib/app
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --inexact --no-dev --extra kubernetes --no-editable
 # Remove build-time dependencies after Python packages are installed.
 # Keep the libpython3.12 RUNTIME package: thread mode (Pemja) dlopens
 # libpython at TaskManager startup; --auto-remove of the -dev package alone
